@@ -1,0 +1,6 @@
+.*.sw[opn]
+*.o
+*~
+
+# build system outputs
+xntest
