@@ -1,20 +1,48 @@
 
+/* TODO: this whole module ignores malloc failures. */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <assert.h>
 
 #include <ccan/list/list.h>
 #include <ccan/htable/htable.h>
 #include <ccan/hash/hash.h>
+#include <ccan/darray/darray.h>
 
 #include "xn.h"
 
 
-struct xn_client {
+#define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+
+#define CHUNK_SIZE (16 * 1024)
+
+
+struct xn_rec;
+
+
+struct xn_chunk {
+	uint16_t next_pos;
+	void *data;
+};
+
+
+struct xn_client
+{
 	int txnid;		/* 24 low bits */
+	darray(struct xn_chunk) rec_chunks;	/* last is active */
+};
+
+
+struct xn_rec
+{
+	struct xn_item *item;
+	uint16_t is_write:1, length:15;
+	uint8_t data[];
 };
 
 
@@ -62,8 +90,13 @@ static void mod_init_fn(void) {
 }
 
 
-static void destroy_xn_client(void *ptr) {
+static void destroy_xn_client(void *ptr)
+{
 	struct xn_client *c = ptr;
+	for(int i=0; i < c->rec_chunks.size; i++) {
+		free(c->rec_chunks.item[i].data);
+	}
+	darray_free(c->rec_chunks);
 	free(c);
 }
 
@@ -71,13 +104,12 @@ static void destroy_xn_client(void *ptr) {
 static struct xn_client *client_ctor(void)
 {
 	struct xn_client *c = malloc(sizeof(*c));
-	if(c == NULL) {
-		perror("malloc");
-		abort();
-	}
-	*c = (struct xn_client){
-		/* whatever */
-	};
+	*c = (struct xn_client){ /* zeroes */ };
+
+	darray_init(c->rec_chunks);
+	struct xn_chunk ck = { .data = malloc(CHUNK_SIZE) };
+	darray_push(c->rec_chunks, ck);
+
 	return c;
 }
 
@@ -156,6 +188,14 @@ int xn_begin(void)
 
 int xn_commit(void)
 {
+	struct xn_client *c = get_client();
+
+	for(int i=1; i < c->rec_chunks.size; i++) {
+		free(c->rec_chunks.item[i].data);
+	}
+	c->rec_chunks.size = 1;
+	c->rec_chunks.item[0].next_pos = 0;
+
 	return 0;
 }
 
@@ -168,19 +208,49 @@ void xn_abort(int status)
 }
 
 
+static struct xn_rec *new_xn_rec(struct xn_client *c, size_t n_bytes)
+{
+	assert(n_bytes < (1 << 15));
+	assert(c->rec_chunks.size > 0);
+
+	struct xn_chunk *ck = &c->rec_chunks.item[c->rec_chunks.size - 1];
+	int max_seg = CHUNK_SIZE - ck->next_pos - sizeof(struct xn_rec);
+	struct xn_rec *rec;
+	if(n_bytes <= max_seg) {
+		/* use the last chunk. */
+		rec = ck->data + ck->next_pos;
+		ck->next_pos += n_bytes + sizeof(struct xn_rec);
+	} else {
+		/* allocate a new chunk. */
+		struct xn_chunk newck = {
+			.data = malloc(CHUNK_SIZE),
+			.next_pos = n_bytes + sizeof(struct xn_rec),
+		};
+		darray_push(c->rec_chunks, newck);
+		rec = newck.data;
+	}
+
+	return rec;
+}
+
+
 int xn_read_int(int *iptr)
 {
-	//struct xn_client *c = get_client();
+	struct xn_client *c = get_client();
 
-	volatile struct xn_item *it = get_item(iptr);
-	volatile int *p = iptr;
-	int value, old_ver;
+	struct xn_item *it = get_item(iptr);
+	int value, old_ver, new_ver = ACCESS_ONCE(it->version);
 	do {
-		old_ver = it->version;
-		value = *p;
-	} while(it->version != old_ver);
+		old_ver = new_ver;
+		value = atomic_load_explicit(iptr, memory_order_acquire);
+	} while((new_ver = ACCESS_ONCE(it->version)) != old_ver);
 
-	/* TODO: add (iptr, old_ver) to c's read set */
+	/* add (iptr, old_ver) to c's read set */
+	struct xn_rec *rec = new_xn_rec(c, sizeof(int));
+	rec->item = (struct xn_item *)it;
+	rec->length = sizeof(int);
+	rec->is_write = false;
+	memcpy(rec->data, &value, sizeof(int));
 
 	return value;
 }
