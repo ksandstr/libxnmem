@@ -1,8 +1,8 @@
 
 CCAN_DIR=~/src/ccan
 
-CFLAGS=-std=gnu11 -Wall -g -march=native -D_GNU_SOURCE -pthread \
-	-I $(CCAN_DIR)
+CFLAGS=-O2 -std=gnu11 -Wall -g -march=native \
+	-D_GNU_SOURCE -pthread -I $(CCAN_DIR)
 
 
 all: xntest
@@ -13,7 +13,7 @@ clean:
 
 
 xntest: xntest.o xn.o \
-		ccan-list.o ccan-htable.o ccan-hash.o
+		ccan-list.o ccan-htable.o ccan-hash.o ccan-tap.o
 	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
 
 

@@ -154,8 +154,18 @@ int xn_begin(void)
 }
 
 
-int xn_commit(void);
-void xn_abort(int status);
+int xn_commit(void)
+{
+	return 0;
+}
+
+
+void xn_abort(int status)
+{
+	if(status == 0) return;
+
+	/* otherwise, uhh, ... */
+}
 
 
 int xn_read_int(int *iptr)
@@ -176,4 +186,7 @@ int xn_read_int(int *iptr)
 }
 
 
-void xn_put(int *iptr, int value);
+void xn_put(int *iptr, int value)
+{
+	*iptr = value;
+}
