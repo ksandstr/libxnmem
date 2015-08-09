@@ -2,7 +2,8 @@
 CCAN_DIR=~/src/ccan
 
 CFLAGS=-O2 -std=gnu11 -Wall -g -march=native \
-	-D_GNU_SOURCE -pthread -I $(CCAN_DIR)
+	-D_GNU_SOURCE -pthread -I $(CCAN_DIR) \
+	-DCCAN_LIST_DEBUG=1 #-DNDEBUG
 
 
 all: xntest
