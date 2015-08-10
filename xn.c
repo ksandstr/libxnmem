@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <string.h>
 #include <pthread.h>
 #include <assert.h>
 
@@ -211,16 +212,55 @@ int xn_begin(void)
 }
 
 
-int xn_commit(void)
+static void clean_client(struct xn_client *c)
 {
-	struct xn_client *c = get_client();
-
 	for(int i=1; i < c->rec_chunks.size; i++) {
 		free(c->rec_chunks.item[i].data);
 	}
 	c->rec_chunks.size = 1;
 	c->rec_chunks.item[0].next_pos = 0;
+}
 
+
+static void commit_write(struct xn_rec *rec, int new_vers)
+{
+	struct xn_item *item = rec->item;
+
+	/* 1. get the write bit, i.e. be the one to flip it */
+	int new_st, old_st = ACCESS_ONCE(item->version);
+	do {
+		if((old_st & ITEM_WRITE_BIT) != 0) {
+			/* FIXME: handle this better */
+			fprintf(stderr, "write-bit conflict in commit_write\n");
+			abort();
+		}
+		new_st = old_st | ITEM_WRITE_BIT;
+	} while(atomic_compare_exchange_weak_explicit(&item->version,
+		&old_st, new_st, memory_order_relaxed, memory_order_relaxed));
+
+	/* 2. copy new data in, then output new version & release write lock */
+	memcpy(item->address, rec->data, rec->length);
+	assert((new_vers & ITEM_WRITE_BIT) == 0);
+	atomic_store_explicit(&item->version, new_vers, memory_order_release);
+}
+
+
+int xn_commit(void)
+{
+	struct xn_client *client = get_client();
+
+	/* the disorganized commit, without ABAB / ABBA protection. */
+	for(int c = 0; c < client->rec_chunks.size; c++) {
+		struct xn_chunk *ck = &client->rec_chunks.item[c];
+		size_t pos = 0;
+		while(pos < ck->next_pos) {
+			struct xn_rec *rec = ck->data + pos;
+			pos += (sizeof(struct xn_rec) + rec->length + 15) & ~15;
+			if(rec->is_write) commit_write(rec, client->txnid & 0xffffff);
+		}
+	}
+
+	clean_client(client);
 	return 0;
 }
 
@@ -230,6 +270,9 @@ void xn_abort(int status)
 	if(status == 0) return;
 
 	/* otherwise, uhh, ... */
+	struct xn_client *c = get_client();
+
+	clean_client(c);
 }
 
 
@@ -314,32 +357,16 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 		size_t hash = bf_hash(c, addr, i);
 		int limb, ix, slot;
 		probe_pos(&slot, &limb, &ix, hash);
-#if 0
-		printf("%s: hash i=%d for %p is %#zx (limb=%#x, ix=%#x)\n",
-			__func__, i, addr, hash, limb, ix);
-#endif
 		count[i] = (c->read_set[limb] >> ix) & 0x3;
 		val[i] = c->rs_words[slot];
-		// printf("... count=%d, val=%u\n", count[i], val[i]);
 
 		switch(count[i]) {
-			case 0:
-				// printf("... absent\n");
-				return NULL;		/* strongly absent. */
+			case 0: return NULL;		/* strongly absent. */
 			case 1:
 				/* absent if invalid, or wrong item. */
-				if(!is_valid_index(c, val[i])) {
-					// printf("... invalid index 0x%x\n", val[i]);
-					return NULL;
-				}
+				if(!is_valid_index(c, val[i])) return NULL;
 				rec[i] = index_to_rec(c, val[i]);
-				if(rec[i]->item->address != addr) {
-#if 0
-					printf("... address mismatch (rec=%p, addr=%p)\n",
-						rec[i]->item->address, addr);
-#endif
-					return NULL;
-				}
+				if(rec[i]->item->address != addr) return NULL;
 				break;
 			case 2:
 				/* TODO: store val[i] ^= val[0], if possible */
@@ -352,18 +379,16 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 	}
 
 	/* pick the median. */
-	struct xn_rec *ret;
+	struct xn_rec *ret = NULL;
 	if(rec[0] == rec[1] || rec[0] == rec[2]) ret = rec[0];
-	else if(rec[1] == rec[2]) ret = rec[0];
-	else {
+	if(ret == NULL || rec[1] == rec[2]) ret = rec[1];
+	if(ret == NULL) {
 		/* no quorum. */
-		// printf("... inconclusive.\n");
 		*ambig_p = true;
 		return NULL;
 	}
 
 	assert(ret->item->address == addr);
-	// printf("... found\n");
 	return ret;
 }
 
@@ -374,10 +399,6 @@ static void bf_insert(struct xn_client *c, void *addr, uint16_t rec_index)
 		size_t hash = bf_hash(c, addr, i);
 		int limb, ix, slot;
 		probe_pos(&slot, &limb, &ix, hash);
-#if 0
-		printf("%s: hash i=%d for %p is %#zx (limb=%#x, ix=%#x)\n",
-			__func__, i, addr, hash, limb, ix);
-#endif
 		/* brute-force saturating increment. */
 		uintptr_t oldval = c->read_set[limb] & (0x3ul << ix);
 		if(oldval == 0) c->rs_words[slot] = 0;	/* lazy cleaning */
