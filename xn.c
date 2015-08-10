@@ -22,6 +22,8 @@
 #define CHUNK_SIZE (12 * 1024)
 #define BF_SIZE (sizeof(uintptr_t) * 8 * 4)
 
+#define ITEM_WRITE_BIT (1 << 24)
+
 
 struct xn_rec;
 
@@ -85,7 +87,7 @@ struct xn_alt
 struct xn_item {
 	void *address;
 	struct xn_alt *alt;
-	int version;	/* txnid */
+	uint32_t version;	/* 24: write bit, 23..0: version (txnid) */
 };
 
 
@@ -231,6 +233,7 @@ void xn_abort(int status)
 }
 
 
+/* NOTE: caller must fill ret->length in */
 static struct xn_rec *new_xn_rec(
 	struct xn_client *c,
 	uint16_t *idx_p,
@@ -441,11 +444,19 @@ int xn_read_int(int *iptr)
 	}
 
 	struct xn_item *it = get_item(iptr);
-	int value, old_ver, new_ver = ACCESS_ONCE(it->version);
+	int value;
+	uint32_t old_ver;
 	do {
-		old_ver = new_ver;
-		value = atomic_load_explicit(iptr, memory_order_acquire);
-	} while((new_ver = ACCESS_ONCE(it->version)) != old_ver);
+		uint32_t new_ver;
+		while(((new_ver = ACCESS_ONCE(it->version)) & ITEM_WRITE_BIT) != 0) {
+			/* sit & spin */
+		}
+		do {
+			if((new_ver & ITEM_WRITE_BIT) != 0) break;
+			old_ver = new_ver;
+			value = atomic_load_explicit(iptr, memory_order_acquire);
+		} while((new_ver = ACCESS_ONCE(it->version)) != old_ver);
+	} while((old_ver & ITEM_WRITE_BIT) != 0);
 
 	/* make new record. */
 	uint16_t idx;
@@ -461,7 +472,43 @@ int xn_read_int(int *iptr)
 }
 
 
+static void *xn_modify(void *ptr, size_t length)
+{
+	struct xn_client *c = get_client();
+	struct xn_rec *rec = find_item_rec(c, ptr);
+	if(rec != NULL) {
+		if(rec->length < length) {
+			fprintf(stderr, "length conflict on %p\n", ptr);
+			abort();
+		}
+	} else {
+		uint16_t rec_idx;
+		rec = new_xn_rec(c, &rec_idx, length);
+		rec->item = get_item(ptr);
+		rec->length = length;
+		rec->is_write = false;
+		bf_insert(c, ptr, rec_idx);
+	}
+
+	if(!rec->is_write) {
+		rec->is_write = true;
+		/* add to write set.
+		 * note: [v1] this could recycle hashes computed for bf_insert().
+		 */
+		for(int i=0; i < 3; i++) {
+			uint32_t h = bf_hash(c, ptr, i);
+			int limb = (h >> (sizeof(uintptr_t) > 4 ? 6 : 5)) & 0x1,
+				bit = h & (sizeof(uintptr_t) > 4 ? 0x3f : 0x1f);
+			c->write_set[limb] |= 1 << bit;
+		}
+	}
+
+	return rec->data;
+}
+
+
 void xn_put(int *iptr, int value)
 {
-	*iptr = value;
+	int *p = xn_modify(iptr, sizeof(*iptr));
+	*p = value;
 }
