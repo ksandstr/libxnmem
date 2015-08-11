@@ -1,5 +1,9 @@
 
-/* most basic tests of the xn_*() primitives. */
+/* tests whether the transaction manager avoids basic ABAB race conditions.
+ *
+ * ordering is attempted via usleep(), which isn't enough. (TODO: fix this
+ * with some semaphores, barriers, or something.)
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +40,6 @@ static void *other_fn(void *priv UNUSED)
 int main(void)
 {
 	plan_tests(3);
-	todo_start("not done yet");
 
 	global_data[0] = 1000; global_data[1] = 0;
 

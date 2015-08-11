@@ -185,15 +185,11 @@ static struct xn_item *get_item(void *ptr)
 }
 
 
-/* proof-of-concept QUALITY */
+/* TODO: this should handle roll-over. currently it does not. */
 static int gen_txnid(void)
 {
 	static int next_txnid = 1;
-	static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
-	pthread_mutex_lock(&mx);
-	int ret = next_txnid++;
-	pthread_mutex_unlock(&mx);
-	return ret;
+	return atomic_fetch_add_explicit(&next_txnid, 1, memory_order_relaxed);
 }
 
 
