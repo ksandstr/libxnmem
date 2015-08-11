@@ -1,7 +1,7 @@
 
 CCAN_DIR=~/src/ccan
 
-CFLAGS:=-Og -std=gnu11 -Wall -g -march=native \
+CFLAGS:=-O2 -std=gnu11 -Wall -g -march=native \
 	-D_GNU_SOURCE -pthread -I $(CCAN_DIR) -I $(abspath .) \
 	-DCCAN_LIST_DEBUG=1 #-DNDEBUG
 
@@ -18,7 +18,7 @@ clean:
 distclean: clean
 	@make -C 
 	rm -f tags
-	rm -r .deps
+	rm -rf .deps
 
 
 check: all
@@ -31,7 +31,8 @@ tags: $(shell find . -iname "*.[ch]" -or -iname "*.p[lm]")
 
 t/%: t/%.c xn.o \
 		ccan-list.o ccan-htable.o ccan-hash.o ccan-tap.o
-	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
+	@echo "  LD $@"
+	@$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
 
 
 ccan-%.o ::
@@ -39,5 +40,11 @@ ccan-%.o ::
 	@$(CC) -c -o $@ $(CCAN_DIR)/ccan/$*/$*.c $(CFLAGS)
 
 
-%.o: %.c
-	$(CC) -c -o $@ $< $(CFLAGS)
+%.o: %.c xn.h
+	@echo "  CC $@"
+	@$(CC) -c -o $@ $< $(CFLAGS) -MMD
+	@test -d .deps || mkdir -p .deps
+	@mv $(<:.c=.d) .deps/
+
+
+include $(wildcard .deps/*.d)

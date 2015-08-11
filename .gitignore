@@ -4,6 +4,7 @@
 tags
 core.*
 core
+.deps
 
 # build system outputs
 xntest
