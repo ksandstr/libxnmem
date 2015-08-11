@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <errno.h>
 #include <string.h>
 #include <pthread.h>
 #include <assert.h>
@@ -58,6 +59,7 @@ struct xn_client
 struct xn_rec
 {
 	struct xn_item *item;
+	int version;
 	uint16_t is_write:1, length:15;
 	uint8_t data[];
 };
@@ -219,49 +221,74 @@ static void clean_client(struct xn_client *c)
 	}
 	c->rec_chunks.size = 1;
 	c->rec_chunks.item[0].next_pos = 0;
-}
 
-
-static void commit_write(struct xn_rec *rec, int new_vers)
-{
-	struct xn_item *item = rec->item;
-
-	/* 1. get the write bit, i.e. be the one to flip it */
-	int new_st, old_st = ACCESS_ONCE(item->version);
-	do {
-		if((old_st & ITEM_WRITE_BIT) != 0) {
-			/* FIXME: handle this better */
-			fprintf(stderr, "write-bit conflict in commit_write\n");
-			abort();
-		}
-		new_st = old_st | ITEM_WRITE_BIT;
-	} while(atomic_compare_exchange_weak_explicit(&item->version,
-		&old_st, new_st, memory_order_relaxed, memory_order_relaxed));
-
-	/* 2. copy new data in, then output new version & release write lock */
-	memcpy(item->address, rec->data, rec->length);
-	assert((new_vers & ITEM_WRITE_BIT) == 0);
-	atomic_store_explicit(&item->version, new_vers, memory_order_release);
+	c->txnid = 0;
 }
 
 
 int xn_commit(void)
 {
 	struct xn_client *client = get_client();
+	int rc, comm_id = gen_txnid();
 
-	/* the disorganized commit, without ABAB / ABBA protection. */
+	/* the "records haven't changed, or fail" model. collects locked items'
+	 * recs in w_list.
+	 */
+	darray(struct xn_rec *) w_list = darray_new();
 	for(int c = 0; c < client->rec_chunks.size; c++) {
 		struct xn_chunk *ck = &client->rec_chunks.item[c];
 		size_t pos = 0;
 		while(pos < ck->next_pos) {
 			struct xn_rec *rec = ck->data + pos;
 			pos += (sizeof(struct xn_rec) + rec->length + 15) & ~15;
-			if(rec->is_write) commit_write(rec, client->txnid & 0xffffff);
+
+			int v_seen = ACCESS_ONCE(rec->item->version);
+			if((v_seen & 0xffffff) != rec->version) goto serfail;
+			if((v_seen & ITEM_WRITE_BIT) != 0) goto serfail;
+			if(rec->is_write) {
+				if(!atomic_compare_exchange_strong_explicit(
+					&rec->item->version, &v_seen, comm_id | ITEM_WRITE_BIT,
+					memory_order_relaxed, memory_order_relaxed))
+				{
+					/* changed between read and write. */
+					goto serfail;
+				}
+				darray_push(w_list, rec);
+			}
 		}
 	}
 
+	if(w_list.size > 0) {
+		/* hooray, let's committing! */
+		for(int i=0; i < w_list.size; i++) {
+			struct xn_rec *rec = w_list.item[i];
+			memcpy(rec->item->address, rec->data, rec->length);
+		}
+		atomic_thread_fence(memory_order_release);
+		/* unlock in relaxed order. */
+		for(int i=0; i < w_list.size; i++) {
+			struct xn_rec *rec = w_list.item[i];
+			atomic_store_explicit(&rec->item->version, comm_id,
+				memory_order_relaxed);
+		}
+	}
+
+	rc = 0;
+
+end:
 	clean_client(client);
-	return 0;
+	darray_free(w_list);
+	return rc;
+
+serfail:
+	/* drop write locks. */
+	for(int i=0; i < w_list.size; i++) {
+		struct xn_rec *rec = w_list.item[i];
+		atomic_fetch_and_explicit(&rec->item->version,
+			~ITEM_WRITE_BIT, memory_order_relaxed);
+	}
+	rc = -EDEADLK;
+	goto end;
 }
 
 
@@ -466,9 +493,8 @@ int xn_read_int(int *iptr)
 
 	struct xn_item *it = get_item(iptr);
 	int value;
-	uint32_t old_ver;
+	uint32_t old_ver, new_ver;
 	do {
-		uint32_t new_ver;
 		while(((new_ver = ACCESS_ONCE(it->version)) & ITEM_WRITE_BIT) != 0) {
 			/* sit & spin */
 		}
@@ -477,7 +503,7 @@ int xn_read_int(int *iptr)
 			old_ver = new_ver;
 			value = atomic_load_explicit(iptr, memory_order_acquire);
 		} while((new_ver = ACCESS_ONCE(it->version)) != old_ver);
-	} while((old_ver & ITEM_WRITE_BIT) != 0);
+	} while((new_ver & ITEM_WRITE_BIT) != 0);
 
 	/* make new record. */
 	uint16_t idx;
@@ -485,6 +511,7 @@ int xn_read_int(int *iptr)
 	rec->item = (struct xn_item *)it;
 	rec->length = sizeof(int);
 	rec->is_write = false;
+	rec->version = old_ver;
 	memcpy(rec->data, &value, sizeof(int));
 	bf_insert(c, iptr, idx);
 	assert(find_item_rec(c, iptr) == rec);
@@ -508,6 +535,10 @@ static void *xn_modify(void *ptr, size_t length)
 		rec->item = get_item(ptr);
 		rec->length = length;
 		rec->is_write = false;
+		/* (not caring about concurrent writes! if one was in progress, this
+		 * transaction will be aborted anyway.)
+		 */
+		rec->version = ACCESS_ONCE(rec->item->version) & 0xffffff;
 		bf_insert(c, ptr, rec_idx);
 	}
 

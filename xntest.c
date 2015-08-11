@@ -29,8 +29,6 @@ static void *other_fn(void *priv UNUSED)
 	} while(status = xn_commit(), XN_RESTART(status));
 	xn_abort(status);
 
-	printf("extracted value was %d\n", (int)v0);
-
 	return (void *)v0;
 }
 
@@ -58,7 +56,6 @@ int main(void)
 		xn_put(&global_data[1], xn_read_int(&global_data[1]) + 2);
 	} while(status = xn_commit(), XN_RESTART(status));
 	xn_abort(status);
-	printf("main's old value was %d\n", v0);
 
 	void *ret = NULL;
 	n = pthread_join(other, &ret);

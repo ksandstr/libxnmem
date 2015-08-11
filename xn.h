@@ -3,9 +3,10 @@
 #define __XN_H__
 
 #include <stdbool.h>
+#include <errno.h>
 
 
-#define XN_RESTART(status) false
+#define XN_RESTART(status) ((status) == -EDEADLK)
 
 
 extern int xn_begin(void);
