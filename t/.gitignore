@@ -1,0 +1,4 @@
+# ignore test binaries, but always include source and headers.
+???_*
+*.o
+!*.[ch]
