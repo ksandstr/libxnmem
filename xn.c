@@ -255,6 +255,7 @@ int xn_commit(void)
 	}
 
 	if(w_list.size > 0) {
+		atomic_thread_fence(memory_order_acquire);
 		/* hooray, let's committing! */
 		for(int i=0; i < w_list.size; i++) {
 			struct xn_rec *rec = w_list.item[i];
@@ -488,8 +489,7 @@ int xn_read_int(int *iptr)
 	}
 
 	struct xn_item *it = get_item(iptr);
-	int value;
-	uint32_t old_ver, new_ver;
+	int value, old_ver, new_ver;
 	do {
 		while(((new_ver = ACCESS_ONCE(it->version)) & ITEM_WRITE_BIT) != 0) {
 			/* sit & spin */
@@ -547,7 +547,7 @@ static void *xn_modify(void *ptr, size_t length)
 			uint32_t h = bf_hash(c, ptr, i);
 			int limb = (h >> (sizeof(uintptr_t) > 4 ? 6 : 5)) & 0x1,
 				bit = h & (sizeof(uintptr_t) > 4 ? 0x3f : 0x1f);
-			c->write_set[limb] |= 1 << bit;
+			c->write_set[limb] |= 1ul << bit;
 		}
 	}
 

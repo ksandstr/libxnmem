@@ -39,15 +39,15 @@ static void *other_fn(void *priv UNUSED)
 
 int main(void)
 {
-	plan_tests(3);
-
 	global_data[0] = 1000; global_data[1] = 0;
+
+	plan_tests(3);
 
 	pthread_t other;
 	int n = pthread_create(&other, NULL, &other_fn, NULL);
 	if(n != 0) {
 		perror("pthread_create");
-		return EXIT_FAILURE;
+		abort();
 	}
 
 	int status, v0;
