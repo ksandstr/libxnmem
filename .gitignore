@@ -1,6 +1,9 @@
 .*.sw[opn]
 *.o
 *~
+tags
+core.*
+core
 
 # build system outputs
 xntest

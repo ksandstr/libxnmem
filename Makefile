@@ -6,11 +6,19 @@ CFLAGS=-O2 -std=gnu11 -Wall -g -march=native \
 	-DCCAN_LIST_DEBUG=1 #-DNDEBUG
 
 
-all: xntest
+all: tags xntest
 
 
 clean:
 	rm -f *.o xntest
+
+
+distclean: clean
+	rm -f tags
+
+
+tags: $(shell find . -iname "*.[ch]" -or -iname "*.p[lm]")
+	@ctags -R *
 
 
 xntest: xntest.o xn.o \
