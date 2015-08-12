@@ -21,14 +21,14 @@ distclean: clean
 
 
 check: all
-	prove $(TEST_BIN)
+	prove -v -m $(TEST_BIN)
 
 
 tags: $(shell find . -iname "*.[ch]" -or -iname "*.p[lm]")
 	@ctags -R *
 
 
-t/%: t/%.c xn.o \
+t/%: t/%.o xn.o \
 		ccan-list.o ccan-htable.o ccan-hash.o ccan-tap.o
 	@echo "  LD $@"
 	@$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
