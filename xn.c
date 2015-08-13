@@ -1,11 +1,14 @@
 
 /* TODO: this whole module ignores malloc failures. */
 
+#define __USE_XOPEN
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
@@ -65,6 +68,23 @@ struct xn_rec
 };
 
 
+/* transaction record. immutable after publication, except for ->next which
+ * can be zeroed when the list is trimmed.
+ *
+ * TODO: come up with an acceptable GC policy for these. right now they leak
+ * memory.
+ */
+struct xn_txn
+{
+	struct xn_txn *_Atomic next;		/* NULL for last */
+	int txnid, commit_id;
+	/* read_set has been compressed to write_set[]'s format, and contains all
+	 * of write_set[].
+	 */
+	uintptr_t read_set[2], write_set[2];
+};
+
+
 /* an alteration. created during item modification, and added to a xn_item at
  * pre-commit.
  *
@@ -96,6 +116,8 @@ struct xn_item {
 
 static pthread_key_t local_key;		/* <struct xn_client *> */
 static uint32_t bloom_salt;
+static struct xn_txn *_Atomic txn_list;
+
 static struct htable item_hash;
 static pthread_mutex_t item_hash_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -109,6 +131,7 @@ static void mod_init_fn(void)
 	pthread_key_create(&local_key, &destroy_xn_client);
 	htable_init(&item_hash, &rehash_xn_item, NULL);
 	bloom_salt = 0x1234abcd;	/* TODO: generate a random number */
+	txn_list = NULL;
 }
 
 
@@ -224,12 +247,88 @@ static void clean_client(struct xn_client *c)
 }
 
 
+/* squash src[4] to dst[2] by compressing 2-bit counts to 1-bit, with
+ * saturation.
+ *
+ * it's almost certainly better to just store the read set in split fields,
+ * than doing 6 copy-shift-ors per input word, or 24 total. a running
+ * accumulator can usually fit under memory loads and/or stores.
+ */
+static void compress_read_set(uintptr_t *dst, const uintptr_t *src)
+{
+	/* byte-sized broadcast, to make mask generation easier. */
+	const uintptr_t bcast = sizeof(uintptr_t) == 4
+		? 0x01010101ul : 0x0101010101010101ul;
+	const uintptr_t wmask = sizeof(uintptr_t) == 4
+		? 0x00ff00fful : 0x00ff00ff00ff00fful;
+	/* bit magic time! */
+	for(int i=0; i < 2; i++) {
+		uintptr_t x = src[i*2 + 0], y = src[i*2 + 1];
+		x |= x >> 1;	/* squash counts. */
+		y |= y >> 1;
+		x &= bcast * 0x55; y &= bcast * 0x55;
+		x |= x >> 1; y |= y >> 1;	/* 0x0x -> 00xx */
+		x &= bcast * 0x33; y &= bcast * 0x33;
+		x |= x >> 2; y |= y >> 2;	/* 00xx00xx -> 0000xxxx */
+		x &= bcast * 0x0f; y &= bcast * 0x0f;
+		x |= x >> 4; y |= y >> 4;	/* 8 bits each */
+		x &= wmask; y &= wmask;
+		x |= x >> 8; y |= y >> 8;	/* 16 bits each. */
+#if __WORDSIZE == 64
+		const uintptr_t dmask = 0x0000ffff0000fffful;
+		x &= dmask; y &= dmask;
+		x |= x >> 16; y |= y >> 16;
+		dst[i] = (x & 0xfffffffful) | (y << 32);
+#else
+#error "not yet done for 32-bit"
+#endif
+	}
+
+#ifndef NDEBUG
+	for(int i=0; i < 4; i++) {
+		for(int j=0; j < __WORDSIZE / 2; j++) {
+			bool d_set = (dst[i / 2] & (1ul << ((i & 1) * 32 + j))) != 0,
+				s_set = (src[i] & (0x3ul << j * 2)) != 0;
+			if(d_set != s_set) {
+				printf("dst[%d]=%#lx, src[%d]=%#lx (i=%d, j=%d)\n",
+					i / 2, dst[i / 2], i, src[i], i, j);
+				printf("... d_set=%d, s_set=%d\n", (int)d_set, (int)s_set);
+			}
+			assert(d_set == s_set);
+		}
+	}
+#endif
+}
+
+
 int xn_commit(void)
 {
 	int rc, comm_id = gen_txnid();
 	darray(struct xn_rec *) w_list = darray_new();
+	struct xn_txn *txn = NULL;
+
 	struct xn_client *client = get_client();
 	if(!client->snapshot_valid) goto serfail;
+
+	txn = malloc(sizeof(*txn));
+	txn->txnid = client->txnid;
+	txn->commit_id = comm_id;
+	memcpy(txn->write_set, client->write_set, sizeof(txn->write_set));
+	compress_read_set(txn->read_set, client->read_set);
+	/* the bloom-filter intersection test for read-to-write dependency. */
+	for(struct xn_txn *cur = atomic_load_explicit(&txn_list,
+			memory_order_consume);
+		cur != NULL;
+		cur = atomic_load_explicit(&cur->next, memory_order_consume))
+	{
+		if(cur->commit_id < client->txnid) continue;
+		bool w_match = false, r_match = false;
+		for(int i=0; i < 2; i++) {
+			w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
+			r_match |= (cur->read_set[i] & txn->write_set[i]) != 0;
+		}
+		if(r_match && w_match) goto serfail;	/* boom! */
+	}
 
 	/* the "records haven't changed, or fail" model. collects locked items'
 	 * recs in w_list.
@@ -255,6 +354,16 @@ int xn_commit(void)
 				darray_push(w_list, rec);
 			}
 		}
+	}
+
+	/* FIXME: this should insert txn into txn_list in order of descending
+	 * commit ID so that the query loop can early-exit.
+	 */
+	txn->next = atomic_load_explicit(&txn_list, memory_order_consume);
+	while(!atomic_compare_exchange_weak_explicit(&txn_list,
+		&txn->next, txn, memory_order_release, memory_order_consume))
+	{
+		/* sit & spin */
 	}
 
 	if(w_list.size > 0) {
@@ -287,6 +396,7 @@ serfail:
 		atomic_fetch_and_explicit(&rec->item->version,
 			~ITEM_WRITE_BIT, memory_order_relaxed);
 	}
+	free(txn);
 	rc = -EDEADLK;
 	goto end;
 }
