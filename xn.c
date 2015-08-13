@@ -40,6 +40,8 @@ struct xn_client
 {
 	int txnid;		/* 24 low bits */
 	darray(struct xn_chunk) rec_chunks;	/* last is active */
+	bool snapshot_valid;	/* early abort criteria */
+
 	size_t salt;	/* for bloom-filter hashing */
 
 	/* bloom filters to track the client's read and write sets. the read set
@@ -201,6 +203,7 @@ int xn_begin(void)
 	struct xn_client *c = get_client();
 	assert(c->txnid == 0);
 	c->txnid = gen_txnid();
+	c->snapshot_valid = true;
 
 	for(int i=0; i < 4; i++) c->read_set[i] = 0;
 	for(int i=0; i < 2; i++) c->write_set[i] = 0;
@@ -224,13 +227,14 @@ static void clean_client(struct xn_client *c)
 
 int xn_commit(void)
 {
-	struct xn_client *client = get_client();
 	int rc, comm_id = gen_txnid();
+	darray(struct xn_rec *) w_list = darray_new();
+	struct xn_client *client = get_client();
+	if(!client->snapshot_valid) goto serfail;
 
 	/* the "records haven't changed, or fail" model. collects locked items'
 	 * recs in w_list.
 	 */
-	darray(struct xn_rec *) w_list = darray_new();
 	for(int c = 0; c < client->rec_chunks.size; c++) {
 		struct xn_chunk *ck = &client->rec_chunks.item[c];
 		size_t pos = 0;
@@ -508,6 +512,7 @@ int xn_read_int(int *iptr)
 	rec->length = sizeof(int);
 	rec->is_write = false;
 	rec->version = old_ver;
+	if(rec->version > c->txnid) c->snapshot_valid = false;
 	memcpy(rec->data, &value, sizeof(int));
 	bf_insert(c, iptr, idx);
 	assert(find_item_rec(c, iptr) == rec);
@@ -535,6 +540,7 @@ static void *xn_modify(void *ptr, size_t length)
 		 * transaction will be aborted anyway.)
 		 */
 		rec->version = ACCESS_ONCE(rec->item->version) & 0xffffff;
+		if(rec->version > c->txnid) c->snapshot_valid = false;
 		bf_insert(c, ptr, rec_idx);
 	}
 
