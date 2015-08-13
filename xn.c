@@ -42,8 +42,6 @@ struct xn_client
 	darray(struct xn_chunk) rec_chunks;	/* last is active */
 	bool snapshot_valid;	/* early abort criteria */
 
-	size_t salt;	/* for bloom-filter hashing */
-
 	/* bloom filters to track the client's read and write sets. the read set
 	 * has two count bits per slot with an invertible uint16_t index for each;
 	 * the write set has a single bit per slot. this means 4 native words for
@@ -97,6 +95,7 @@ struct xn_item {
 
 
 static pthread_key_t local_key;		/* <struct xn_client *> */
+static uint32_t bloom_salt;
 static struct htable item_hash;
 static pthread_mutex_t item_hash_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -105,9 +104,11 @@ static void destroy_xn_client(void *ptr);
 static size_t rehash_xn_item(const void *item, void *priv);
 
 
-static void mod_init_fn(void) {
+static void mod_init_fn(void)
+{
 	pthread_key_create(&local_key, &destroy_xn_client);
 	htable_init(&item_hash, &rehash_xn_item, NULL);
+	bloom_salt = 0x1234abcd;	/* TODO: generate a random number */
 }
 
 
@@ -126,8 +127,6 @@ static struct xn_client *client_ctor(void)
 {
 	struct xn_client *c = malloc(sizeof(*c));
 	*c = (struct xn_client){ /* zeroes */ };
-	/* FIXME: generate a randomized salt instead */
-	c->salt = 0x1234abcd ^ (uintptr_t)&c ^ (uintptr_t)&c->salt;
 
 	darray_init(c->rec_chunks);
 	struct xn_chunk ck = { .data = malloc(CHUNK_SIZE) };
@@ -340,7 +339,7 @@ static struct xn_rec *new_xn_rec(
 
 
 static inline size_t bf_hash(struct xn_client *c, void *ptr, int i) {
-	return hash_pointer(ptr, c->salt + i * 7);
+	return hash_pointer(ptr, bloom_salt + i * 7);
 }
 
 
