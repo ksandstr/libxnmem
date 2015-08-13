@@ -243,8 +243,8 @@ int xn_commit(void)
 			pos += (sizeof(struct xn_rec) + rec->length + 15) & ~15;
 
 			int v_seen = ACCESS_ONCE(rec->item->version);
-			if((v_seen & 0xffffff) != rec->version) goto serfail;
-			if((v_seen & ITEM_WRITE_BIT) != 0) goto serfail;
+			assert((rec->version & ITEM_WRITE_BIT) == 0);
+			if(v_seen != rec->version) goto serfail;
 			if(rec->is_write) {
 				if(!atomic_compare_exchange_strong_explicit(
 					&rec->item->version, &v_seen, comm_id | ITEM_WRITE_BIT,
