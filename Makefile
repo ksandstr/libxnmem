@@ -16,7 +16,6 @@ clean:
 
 
 distclean: clean
-	@make -C 
 	rm -f tags
 	rm -rf .deps
 
