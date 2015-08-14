@@ -12,7 +12,7 @@ all: tags $(TEST_BIN)
 
 
 clean:
-	rm -f *.o xntest $(TEST_BIN)
+	rm -f *.o xntest t/*.o $(TEST_BIN)
 
 
 distclean: clean
@@ -20,8 +20,8 @@ distclean: clean
 	rm -rf .deps
 
 
-check: all
-	prove -v -m $(TEST_BIN)
+check: $(TEST_BIN)
+	prove -v -m $(sort $(TEST_BIN))
 
 
 tags: $(shell find . -iname "*.[ch]" -or -iname "*.p[lm]")
@@ -39,7 +39,7 @@ ccan-%.o ::
 	@$(CC) -c -o $@ $(CCAN_DIR)/ccan/$*/$*.c $(CFLAGS)
 
 
-%.o: %.c xn.h
+%.o: %.c
 	@echo "  CC $@"
 	@$(CC) -c -o $@ $< $(CFLAGS) -MMD
 	@test -d .deps || mkdir -p .deps
