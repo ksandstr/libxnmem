@@ -26,13 +26,18 @@
 #define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
 
 #define MSB(x) (sizeof((x)) * 8 - __builtin_clzl((x)) - 1)
-
-#define CHUNK_SIZE (12 * 1024)
-#define BF_SIZE (sizeof(uintptr_t) * 8 * 4)
-
-#define ITEM_WRITE_BIT (1 << 24)
-
 #define ALIGN_TO_CACHELINE __attribute__((aligned(64)))
+
+#define ITEM_WRITE_BIT (1 << 24)	/* in xn_item.version */
+#define CHUNK_SIZE (12 * 1024)		/* bytes under xn_chunk.data */
+
+/* bloom filter configuration. larger filters are more accurate, but cause
+ * more processing overhead. must be at least 6, and 8 is usually the sweet
+ * spot.
+ */
+#define BF_SIZE_LOG2 8
+#define BF_NUM_SLOTS (1 << BF_SIZE_LOG2)
+#define BF_NUM_WORDS (BF_NUM_SLOTS / (sizeof(uintptr_t) * 8))
 
 
 struct xn_chunk {
@@ -75,7 +80,7 @@ struct xn_txn
 	/* read_set has been compressed to write_set[]'s format, and contains all
 	 * of write_set[].
 	 */
-	uintptr_t read_set[2], write_set[2];
+	uintptr_t read_set[BF_NUM_WORDS], write_set[BF_NUM_WORDS];
 	struct list_head dtors;			/* <struct xn_dtor>, malloc'd */
 };
 
@@ -94,14 +99,15 @@ struct xn_client
 	/* bloom filters track the client's read and write sets. the read set has
 	 * two count bits per slot with an invertible uint16_t index for each; the
 	 * write set has a single bit per slot. this means 4 native words for the
-	 * read set, 2 for the write set, and 64-or-128 slots.
+	 * read set, 2 for the write set, and 64-or-128 slots (when BF_SIZE_LOG2 =
+	 * 2, anyway).
 	 *
 	 * each member of rs_words[] has the following format: high 8 bits
 	 * indicate chunk index, and low 8 are bits 11..4 of the in-chunk index
 	 * (aligned to 16).
 	 */
-	uintptr_t read_set[4], write_set[2];
-	uint16_t rs_words[BF_SIZE];
+	uintptr_t read_set[BF_NUM_WORDS * 2], write_set[BF_NUM_WORDS];
+	uint16_t rs_words[BF_NUM_SLOTS];
 
 	/* data subject to concurrent access by other threads. */
 	_Atomic uint32_t epoch ALIGN_TO_CACHELINE;
@@ -322,8 +328,8 @@ int xn_begin(void)
 	c->txn->txnid = gen_txnid();
 	list_head_init(&c->txn->dtors);
 
-	for(int i=0; i < 4; i++) c->read_set[i] = 0;
-	for(int i=0; i < 2; i++) c->write_set[i] = 0;
+	for(int i=0; i < BF_NUM_WORDS * 2; i++) c->read_set[i] = 0;
+	for(int i=0; i < BF_NUM_WORDS; i++) c->write_set[i] = 0;
 	/* no need to clear the actual slots. */
 
 	/* see if the epoch scheme needs a spin, which it does if txnid + 1 has N
@@ -371,7 +377,7 @@ static void compress_read_set(uintptr_t *dst, const uintptr_t *src)
 	const uintptr_t wmask = sizeof(uintptr_t) == 4
 		? 0x00ff00fful : 0x00ff00ff00ff00fful;
 	/* bit magic time! */
-	for(int i=0; i < 2; i++) {
+	for(int i=0; i < BF_NUM_WORDS; i++) {
 		uintptr_t x = src[i*2 + 0], y = src[i*2 + 1];
 		x |= x >> 1;	/* squash counts. */
 		y |= y >> 1;
@@ -394,7 +400,7 @@ static void compress_read_set(uintptr_t *dst, const uintptr_t *src)
 	}
 
 #ifndef NDEBUG
-	for(int i=0; i < 4; i++) {
+	for(int i=0; i < BF_NUM_WORDS * 2; i++) {
 		for(int j=0; j < __WORDSIZE / 2; j++) {
 			bool d_set = (dst[i / 2] & (1ul << ((i & 1) * 32 + j))) != 0,
 				s_set = (src[i] & (0x3ul << j * 2)) != 0;
@@ -438,7 +444,7 @@ int xn_commit(void)
 		{
 			if(cur->commit_id < txn->txnid) continue;
 			bool w_match = false, r_match = false;
-			for(int i=0; i < 2; i++) {
+			for(int i=0; i < BF_NUM_WORDS; i++) {
 				w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
 				r_match |= (cur->read_set[i] & txn->write_set[i]) != 0;
 			}
@@ -521,7 +527,7 @@ serfail:
 static void finish_txn(struct xn_txn *txn)
 {
 #ifndef NDEBUG
-	for(int i=0; i < 2; i++) {
+	for(int i=0; i < BF_NUM_WORDS; i++) {
 		txn->read_set[i] = txn->write_set[i] = ~0ull;
 	}
 #endif
@@ -625,9 +631,9 @@ static inline void probe_pos(int *slot, int *limb, int *ix, size_t hash)
 	const int shift = sizeof(uintptr_t) > 4 ? 6 : 5,
 		mask = (1 << shift) - 1;
 
-	*slot = hash & (BF_SIZE - 1);
+	*slot = hash & (BF_NUM_SLOTS - 1);
 	hash *= 2;
-	*limb = (hash >> shift) & 0x3;
+	*limb = (hash >> shift) & (BF_NUM_WORDS - 1);
 	*ix = hash & mask;
 }
 
