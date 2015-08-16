@@ -35,18 +35,59 @@
 #define ALIGN_TO_CACHELINE __attribute__((aligned(64)))
 
 
-struct xn_rec;
-
-
 struct xn_chunk {
 	uint16_t next_pos;
 	void *data;
 };
 
 
+struct xn_item {
+	void *address;
+	uint32_t version;	/* 24: write bit, 23..0: version (txnid) */
+};
+
+
+struct xn_rec
+{
+	struct xn_item *item;
+	int version;
+	uint16_t is_write:1, length:15;
+	uint8_t data[];
+};
+
+
+/* destructor closure inna list. */
+struct xn_dtor {
+	struct list_node link;		/* in xn_txn.dtors */
+	void (*dtor_fn)(void *param);
+	void *param;
+};
+
+
+/* transaction record. immutable after publication except for ->next which
+ * can be zeroed when the list is trimmed. removed per the epoch mechanism via
+ * rotation of txn_list[] thru txn_epoch.
+ */
+struct xn_txn
+{
+	struct xn_txn *_Atomic next;		/* NULL for last */
+	int txnid, commit_id;
+	/* read_set has been compressed to write_set[]'s format, and contains all
+	 * of write_set[].
+	 */
+	uintptr_t read_set[2], write_set[2];
+	struct list_head dtors;			/* <struct xn_dtor>, malloc'd */
+};
+
+
 struct xn_client
 {
-	int txnid;		/* 24 low bits */
+	/* the in-progress transaction. its txnid and dtors fields are filled in
+	 * during the transaction's execution, and it is destroyed or published by
+	 * xn_abort() or xn_commit() respectively.
+	 */
+	struct xn_txn *txn;
+
 	darray(struct xn_chunk) rec_chunks;	/* last is active */
 	bool snapshot_valid;	/* early abort criteria */
 
@@ -65,36 +106,6 @@ struct xn_client
 	/* data subject to concurrent access by other threads. */
 	_Atomic uint32_t epoch ALIGN_TO_CACHELINE;
 	struct list_node link;	/* in client_list, under client_list_lock */
-};
-
-
-struct xn_rec
-{
-	struct xn_item *item;
-	int version;
-	uint16_t is_write:1, length:15;
-	uint8_t data[];
-};
-
-
-/* transaction record. immutable after publication, except for ->next which
- * can be zeroed when the list is trimmed. removed per the epoch mechanism via
- * rotation of txn_list[] thru txn_epoch.
- */
-struct xn_txn
-{
-	struct xn_txn *_Atomic next;		/* NULL for last */
-	int txnid, commit_id;
-	/* read_set has been compressed to write_set[]'s format, and contains all
-	 * of write_set[].
-	 */
-	uintptr_t read_set[2], write_set[2];
-};
-
-
-struct xn_item {
-	void *address;
-	uint32_t version;	/* 24: write bit, 23..0: version (txnid) */
 };
 
 
@@ -269,12 +280,10 @@ static void tick_txn_epoch(void)
 }
 
 
-static void check_txn_epoch(void)
+static void check_txn_epoch(uint32_t cur_epoch)
 {
 	bool all_seen = true;
 	pthread_rwlock_rdlock(&client_list_lock);
-	uint32_t cur_epoch = atomic_load_explicit(&txn_epoch,
-		memory_order_consume);
 	struct xn_client *c;
 	list_for_each(&client_list, c, link) {
 		if(atomic_load_explicit(&c->epoch,
@@ -303,12 +312,15 @@ int xn_begin(void)
 	pthread_once(&mod_init, &mod_init_fn);
 
 	struct xn_client *c = get_client();
-	assert(c->txnid == 0);
+	assert(c->txn == NULL);
+	uint32_t cur_epoch;
 	atomic_store_explicit(&c->epoch,
-		atomic_load_explicit(&txn_epoch, memory_order_relaxed),
+		cur_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed),
 		memory_order_relaxed);
-	c->txnid = gen_txnid();
 	c->snapshot_valid = true;
+	c->txn = malloc(sizeof(struct xn_txn));
+	c->txn->txnid = gen_txnid();
+	list_head_init(&c->txn->dtors);
 
 	for(int i=0; i < 4; i++) c->read_set[i] = 0;
 	for(int i=0; i < 2; i++) c->write_set[i] = 0;
@@ -319,7 +331,7 @@ int xn_begin(void)
 	 */
 	int mask = (1 << size_to_shift(2 * atomic_load_explicit(&client_count,
 		memory_order_relaxed))) - 1;
-	if(((c->txnid + 1) & mask) == 0) check_txn_epoch();
+	if(((c->txn->txnid + 1) & mask) == 0) check_txn_epoch(cur_epoch);
 
 	return 0;
 }
@@ -327,13 +339,20 @@ int xn_begin(void)
 
 static void clean_client(struct xn_client *c)
 {
+	if(c->txn != NULL) {
+		struct xn_dtor *cur, *next;
+		list_for_each_safe(&c->txn->dtors, cur, next, link) {
+			list_del_from(&c->txn->dtors, &cur->link);
+			free(cur);
+		}
+		free(c->txn); c->txn = NULL;
+	}
+
 	for(int i=1; i < c->rec_chunks.size; i++) {
 		free(c->rec_chunks.item[i].data);
 	}
 	c->rec_chunks.size = 1;
 	c->rec_chunks.item[0].next_pos = 0;
-
-	c->txnid = 0;
 }
 
 
@@ -400,8 +419,8 @@ int xn_commit(void)
 	struct xn_client *client = get_client();
 	if(!client->snapshot_valid) goto serfail;
 
-	txn = malloc(sizeof(*txn));
-	txn->txnid = client->txnid;
+	txn = client->txn;
+	client->txn = NULL;
 	txn->commit_id = comm_id;
 	memcpy(txn->write_set, client->write_set, sizeof(txn->write_set));
 	compress_read_set(txn->read_set, client->read_set);
@@ -417,7 +436,7 @@ int xn_commit(void)
 			cur != NULL;
 			cur = atomic_load_explicit(&cur->next, memory_order_consume))
 		{
-			if(cur->commit_id < client->txnid) continue;
+			if(cur->commit_id < txn->txnid) continue;
 			bool w_match = false, r_match = false;
 			for(int i=0; i < 2; i++) {
 				w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
@@ -501,9 +520,19 @@ serfail:
 
 static void finish_txn(struct xn_txn *txn)
 {
+#ifndef NDEBUG
 	for(int i=0; i < 2; i++) {
 		txn->read_set[i] = txn->write_set[i] = ~0ull;
 	}
+#endif
+
+	struct xn_dtor *cur, *next;
+	list_for_each_safe(&txn->dtors, cur, next, link) {
+		list_del_from(&txn->dtors, &cur->link);
+		(*cur->dtor_fn)(cur->param);
+		free(cur);
+	}
+
 	free(txn);
 }
 
@@ -516,6 +545,21 @@ void xn_abort(int status)
 	struct xn_client *c = get_client();
 
 	clean_client(c);
+}
+
+
+void xn_dtor(void (*fn)(void *param), void *param)
+{
+	struct xn_client *c = get_client();
+	struct xn_dtor *d = malloc(sizeof(*d));
+	d->dtor_fn = fn;
+	d->param = param;
+	list_add_tail(&c->txn->dtors, &d->link);
+}
+
+
+void xn_free(void *ptr) {
+	xn_dtor(&free, ptr);
 }
 
 
@@ -727,7 +771,7 @@ int xn_read_int(int *iptr)
 	rec->length = sizeof(int);
 	rec->is_write = false;
 	rec->version = old_ver;
-	if(rec->version > c->txnid) c->snapshot_valid = false;
+	if(rec->version > c->txn->txnid) c->snapshot_valid = false;
 	memcpy(rec->data, &value, sizeof(int));
 	bf_insert(c, iptr, idx);
 	assert(find_item_rec(c, iptr) == rec);
@@ -755,7 +799,7 @@ static void *xn_modify(void *ptr, size_t length)
 		 * transaction will be aborted anyway.)
 		 */
 		rec->version = ACCESS_ONCE(rec->item->version) & 0xffffff;
-		if(rec->version > c->txnid) c->snapshot_valid = false;
+		if(rec->version > c->txn->txnid) c->snapshot_valid = false;
 		bf_insert(c, ptr, rec_idx);
 	}
 
