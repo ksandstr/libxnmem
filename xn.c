@@ -22,12 +22,17 @@
 #include "xn.h"
 
 
+/* TODO: remove this in favour of C11 atomic loads */
 #define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+
+#define MSB(x) (sizeof((x)) * 8 - __builtin_clzl((x)) - 1)
 
 #define CHUNK_SIZE (12 * 1024)
 #define BF_SIZE (sizeof(uintptr_t) * 8 * 4)
 
 #define ITEM_WRITE_BIT (1 << 24)
+
+#define ALIGN_TO_CACHELINE __attribute__((aligned(64)))
 
 
 struct xn_rec;
@@ -45,10 +50,10 @@ struct xn_client
 	darray(struct xn_chunk) rec_chunks;	/* last is active */
 	bool snapshot_valid;	/* early abort criteria */
 
-	/* bloom filters to track the client's read and write sets. the read set
-	 * has two count bits per slot with an invertible uint16_t index for each;
-	 * the write set has a single bit per slot. this means 4 native words for
-	 * the read set, 2 for the write set, and 64-or-128 slots.
+	/* bloom filters track the client's read and write sets. the read set has
+	 * two count bits per slot with an invertible uint16_t index for each; the
+	 * write set has a single bit per slot. this means 4 native words for the
+	 * read set, 2 for the write set, and 64-or-128 slots.
 	 *
 	 * each member of rs_words[] has the following format: high 8 bits
 	 * indicate chunk index, and low 8 are bits 11..4 of the in-chunk index
@@ -56,6 +61,10 @@ struct xn_client
 	 */
 	uintptr_t read_set[4], write_set[2];
 	uint16_t rs_words[BF_SIZE];
+
+	/* data subject to concurrent access by other threads. */
+	_Atomic uint32_t epoch ALIGN_TO_CACHELINE;
+	struct list_node link;	/* in client_list, under client_list_lock */
 };
 
 
@@ -69,10 +78,8 @@ struct xn_rec
 
 
 /* transaction record. immutable after publication, except for ->next which
- * can be zeroed when the list is trimmed.
- *
- * TODO: come up with an acceptable GC policy for these. right now they leak
- * memory.
+ * can be zeroed when the list is trimmed. removed per the epoch mechanism via
+ * rotation of txn_list[] thru txn_epoch.
  */
 struct xn_txn
 {
@@ -85,38 +92,48 @@ struct xn_txn
 };
 
 
-/* an alteration. created during item modification, and added to a xn_item at
- * pre-commit.
- *
- * there are three kinds: lazy, eager, and smart. the first represents data
- * that'll be copied in at commit, the second is data that'll be copied back
- * on rollback, and the third is a piece of code that runs at commit/rollback
- * and always does the right thing. kind is indicated by content of ->len; if
- * it's positive, the change is lazy; negative for eager; and zero for smart.
- */
-struct xn_alt
-{
-	int len, version;	/* version is new for lazy, old otherwise */
-	union {
-		struct {
-			void (*fn)(void *priv);
-			void *priv;
-		} smart;
-		uint8_t data[0];
-	} u0;
-};
-
-
 struct xn_item {
 	void *address;
-	struct xn_alt *alt;
 	uint32_t version;	/* 24: write bit, 23..0: version (txnid) */
 };
 
 
 static pthread_key_t local_key;		/* <struct xn_client *> */
 static uint32_t bloom_salt;
-static struct xn_txn *_Atomic txn_list;
+
+/* the previous transactions' list. cleared with the epoch method, where ticks
+ * happen when a (selected) beginning transaction notes that all active
+ * clients have seen txn_epoch.
+ *
+ * FIXME: txn_epoch doesn't handle roll-over. this is unfortunate, but
+ * gen_txnid() and the txnid comparisons also don't handle roll-over, and
+ * that'll always happen sooner -- so it doesn't matter for now.
+ *
+ * TODO: unfortunately this requires all client threads to be active at least
+ * once before a tick can happen, and twice to clear a backlog caused by e.g.
+ * a long absence. to solve this, add a "txnids under X are dead" rule, so
+ * that a single client's extended inactivity will only cause its transaction
+ * to fail instead of keeping useless memory around indefinitely.
+ *
+ * note that the proposed algorithm doesn't involve ticking the epoch forward
+ * despite a client not having observed it. that could be done if each client
+ * set a flag saying that the epoch must not tick, in addition to its observed
+ * epoch; this'd defer epoch-tick processing.
+ */
+static _Atomic uint32_t txn_epoch = 2;
+static volatile atomic_flag epoch_lock;
+/* [txn_epoch + 1 mod 4] = NULL
+ * [txn_epoch     mod 4] = committed txns (r/w by xn_commit());
+ * [txn_epoch - 1 mod 4] = pre-dead txns (r by xn_commit());
+ * [txn_epoch - 2 mod 4] = dead txns
+ *
+ * bumping the epoch requires that the next slot has been cleared.
+ */
+static struct xn_txn *_Atomic txn_list[4];
+
+static struct list_head client_list = LIST_HEAD_INIT(client_list);
+static pthread_rwlock_t client_list_lock = PTHREAD_RWLOCK_INITIALIZER;
+static _Atomic int client_count = 0;
 
 static struct htable item_hash;
 static pthread_mutex_t item_hash_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -124,6 +141,13 @@ static pthread_mutex_t item_hash_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void destroy_xn_client(void *ptr);
 static size_t rehash_xn_item(const void *item, void *priv);
+static void finish_txn(struct xn_txn *txn);
+
+
+static inline int size_to_shift(size_t size) {
+	int msb = MSB(size);
+	return (1 << msb) < size ? msb + 1 : msb;
+}
 
 
 static void mod_init_fn(void)
@@ -131,13 +155,18 @@ static void mod_init_fn(void)
 	pthread_key_create(&local_key, &destroy_xn_client);
 	htable_init(&item_hash, &rehash_xn_item, NULL);
 	bloom_salt = 0x1234abcd;	/* TODO: generate a random number */
-	txn_list = NULL;
+	for(int i=0; i < 4; i++) txn_list[i] = NULL;
+	atomic_flag_clear(&epoch_lock);
 }
 
 
 static void destroy_xn_client(void *ptr)
 {
 	struct xn_client *c = ptr;
+	atomic_fetch_sub_explicit(&client_count, 1, memory_order_relaxed);
+	pthread_rwlock_wrlock(&client_list_lock);
+	list_del_from(&client_list, &c->link);
+	pthread_rwlock_unlock(&client_list_lock);
 	for(int i=0; i < c->rec_chunks.size; i++) {
 		free(c->rec_chunks.item[i].data);
 	}
@@ -154,6 +183,11 @@ static struct xn_client *client_ctor(void)
 	darray_init(c->rec_chunks);
 	struct xn_chunk ck = { .data = malloc(CHUNK_SIZE) };
 	darray_push(c->rec_chunks, ck);
+
+	atomic_fetch_add_explicit(&client_count, 1, memory_order_relaxed);
+	pthread_rwlock_wrlock(&client_list_lock);
+	list_add(&client_list, &c->link);
+	pthread_rwlock_unlock(&client_list_lock);
 
 	return c;
 }
@@ -209,6 +243,52 @@ static struct xn_item *get_item(void *ptr)
 }
 
 
+/* move the epoch lists over and destroy the old dead-list's contents. */
+static void tick_txn_epoch(void)
+{
+	/* get the lock or go away. */
+	if(atomic_flag_test_and_set(&epoch_lock)) {
+		/* true = was already locked */
+		return;
+	}
+
+	/* take the dead-list, prepare the next tick's new dead-list, and bump the
+	 * epoch number.
+	 */
+	uint32_t old_epoch = atomic_load(&txn_epoch);
+	struct xn_txn *dead = atomic_exchange(
+		&txn_list[(old_epoch - 2) & 3], NULL);
+	assert(txn_list[(old_epoch + 1) & 3] == NULL);
+	atomic_fetch_add_explicit(&txn_epoch, 1, memory_order_release);
+	atomic_flag_clear_explicit(&epoch_lock, memory_order_release);
+
+	for(struct xn_txn *cur = dead, *next; cur != NULL; cur = next) {
+		next = cur->next;
+		finish_txn(cur);
+	}
+}
+
+
+static void check_txn_epoch(void)
+{
+	bool all_seen = true;
+	pthread_rwlock_rdlock(&client_list_lock);
+	uint32_t cur_epoch = atomic_load_explicit(&txn_epoch,
+		memory_order_consume);
+	struct xn_client *c;
+	list_for_each(&client_list, c, link) {
+		if(atomic_load_explicit(&c->epoch,
+			memory_order_relaxed) != cur_epoch)
+		{
+			all_seen = false;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&client_list_lock);
+	if(all_seen) tick_txn_epoch();
+}
+
+
 /* TODO: this should handle roll-over. currently it does not. */
 static int gen_txnid(void)
 {
@@ -224,12 +304,22 @@ int xn_begin(void)
 
 	struct xn_client *c = get_client();
 	assert(c->txnid == 0);
+	atomic_store_explicit(&c->epoch,
+		atomic_load_explicit(&txn_epoch, memory_order_relaxed),
+		memory_order_relaxed);
 	c->txnid = gen_txnid();
 	c->snapshot_valid = true;
 
 	for(int i=0; i < 4; i++) c->read_set[i] = 0;
 	for(int i=0; i < 2; i++) c->write_set[i] = 0;
 	/* no need to clear the actual slots. */
+
+	/* see if the epoch scheme needs a spin, which it does if txnid + 1 has N
+	 * lowest bits cleared, where 2^N >= 2 * client_count .
+	 */
+	int mask = (1 << size_to_shift(2 * atomic_load_explicit(&client_count,
+		memory_order_relaxed))) - 1;
+	if(((c->txnid + 1) & mask) == 0) check_txn_epoch();
 
 	return 0;
 }
@@ -315,19 +405,26 @@ int xn_commit(void)
 	txn->commit_id = comm_id;
 	memcpy(txn->write_set, client->write_set, sizeof(txn->write_set));
 	compress_read_set(txn->read_set, client->read_set);
+	uint32_t epoch = atomic_load_explicit(&client->epoch,
+		memory_order_consume);
+	struct xn_txn *old_txns[2] = {
+		atomic_load_explicit(&txn_list[epoch & 3], memory_order_relaxed),
+		atomic_load_explicit(&txn_list[(epoch - 1) & 3], memory_order_relaxed),
+	};
 	/* the bloom-filter intersection test for read-to-write dependency. */
-	for(struct xn_txn *cur = atomic_load_explicit(&txn_list,
-			memory_order_consume);
-		cur != NULL;
-		cur = atomic_load_explicit(&cur->next, memory_order_consume))
-	{
-		if(cur->commit_id < client->txnid) continue;
-		bool w_match = false, r_match = false;
-		for(int i=0; i < 2; i++) {
-			w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
-			r_match |= (cur->read_set[i] & txn->write_set[i]) != 0;
+	for(int lst = 0; lst < 2; lst++) {
+		for(struct xn_txn *cur = old_txns[lst];
+			cur != NULL;
+			cur = atomic_load_explicit(&cur->next, memory_order_consume))
+		{
+			if(cur->commit_id < client->txnid) continue;
+			bool w_match = false, r_match = false;
+			for(int i=0; i < 2; i++) {
+				w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
+				r_match |= (cur->read_set[i] & txn->write_set[i]) != 0;
+			}
+			if(r_match && w_match) goto serfail;	/* boom! */
 		}
-		if(r_match && w_match) goto serfail;	/* boom! */
 	}
 
 	/* the "records haven't changed, or fail" model. collects locked items'
@@ -359,8 +456,8 @@ int xn_commit(void)
 	/* FIXME: this should insert txn into txn_list in order of descending
 	 * commit ID so that the query loop can early-exit.
 	 */
-	txn->next = atomic_load_explicit(&txn_list, memory_order_consume);
-	while(!atomic_compare_exchange_weak_explicit(&txn_list,
+	txn->next = atomic_load_explicit(&txn_list[epoch & 3], memory_order_consume);
+	while(!atomic_compare_exchange_weak_explicit(&txn_list[epoch & 3],
 		&txn->next, txn, memory_order_release, memory_order_consume))
 	{
 		/* sit & spin */
@@ -399,6 +496,15 @@ serfail:
 	free(txn);
 	rc = -EDEADLK;
 	goto end;
+}
+
+
+static void finish_txn(struct xn_txn *txn)
+{
+	for(int i=0; i < 2; i++) {
+		txn->read_set[i] = txn->write_set[i] = ~0ull;
+	}
+	free(txn);
 }
 
 
