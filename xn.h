@@ -13,8 +13,9 @@ extern int xn_begin(void);
 extern int xn_commit(void);
 extern void xn_abort(int status);
 
-/* destructors are run sometime after successful commit. they are discarded at
- * transaction abort.
+/* destructors are run sometime after successful commit. they execute in an
+ * indeterminate thread's context and must not call any xn_*() function. at
+ * transaction abort, all dtors are discarded and won't be run.
  */
 extern void xn_dtor(void (*fn)(void *param), void *param);
 extern void xn_free(void *ptr);		/* wrapper for free(3) */

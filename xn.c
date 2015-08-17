@@ -485,7 +485,7 @@ static void finish_txn(struct xn_txn *txn)
 {
 #ifndef NDEBUG
 	for(int i=0; i < BF_NUM_WORDS; i++) {
-		txn->read_set[i] = txn->write_set[i] = ~0ull;
+		txn->read_set[i] = txn->write_set[i] = ~0ul;
 	}
 #endif
 
