@@ -260,7 +260,7 @@ static struct xn_item *get_item(void *ptr)
 
 
 /* move the epoch lists over and destroy the old dead-list's contents. */
-static void tick_txn_epoch(void)
+static void tick_txn_epoch(uint32_t old_epoch)
 {
 	/* get the lock or go away. */
 	if(atomic_flag_test_and_set(&epoch_lock)) {
@@ -268,14 +268,22 @@ static void tick_txn_epoch(void)
 		return;
 	}
 
-	/* take the dead-list, prepare the next tick's new dead-list, and bump the
-	 * epoch number.
+	/* try to bump the epoch number, because another epoch-bumper may have
+	 * done its thing right before our test-and-set. on failure, back down.
 	 */
-	uint32_t old_epoch = atomic_load(&txn_epoch);
-	struct xn_txn *dead = atomic_exchange(
-		&txn_list[(old_epoch - 2) & 3], NULL);
-	assert(txn_list[(old_epoch + 1) & 3] == NULL);
-	atomic_fetch_add_explicit(&txn_epoch, 1, memory_order_release);
+	if(!atomic_compare_exchange_strong_explicit(&txn_epoch,
+		&old_epoch, old_epoch + 1, memory_order_relaxed,
+		memory_order_relaxed))
+	{
+		atomic_flag_clear(&epoch_lock);
+		return;
+	}
+
+	/* take the dead-list, prepare the next tick's new dead-list, and unlock
+	 * the epoch-tick mechanism.
+	 */
+	struct xn_txn *dead = atomic_exchange_explicit(
+		&txn_list[(old_epoch - 2) & 3], NULL, memory_order_relaxed);
 	atomic_flag_clear_explicit(&epoch_lock, memory_order_release);
 
 	for(struct xn_txn *cur = dead, *next; cur != NULL; cur = next) {
@@ -299,7 +307,7 @@ static void check_txn_epoch(uint32_t cur_epoch)
 		}
 	}
 	pthread_rwlock_unlock(&client_list_lock);
-	if(all_seen) tick_txn_epoch();
+	if(all_seen) tick_txn_epoch(cur_epoch);
 }
 
 
