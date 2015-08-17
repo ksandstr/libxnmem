@@ -77,8 +77,8 @@ struct xn_txn
 {
 	struct xn_txn *_Atomic next;		/* NULL for last */
 	int txnid, commit_id;
-	/* read_set has been compressed to write_set[]'s format, and contains all
-	 * of write_set[].
+	/* read_set[] contains the count's lower bits side by side. it has the
+	 * exact same format as write_set[] once published.
 	 */
 	uintptr_t read_set[BF_NUM_WORDS], write_set[BF_NUM_WORDS];
 	struct list_head dtors;			/* <struct xn_dtor>, malloc'd */
@@ -97,16 +97,15 @@ struct xn_client
 	bool snapshot_valid;	/* early abort criteria */
 
 	/* bloom filters track the client's read and write sets. the read set has
-	 * two count bits per slot with an invertible uint16_t index for each; the
-	 * write set has a single bit per slot. this means 4 native words for the
-	 * read set, 2 for the write set, and 64-or-128 slots (when BF_SIZE_LOG2 =
-	 * 2, anyway).
+	 * two count bits per slot (split so that the low bit is in
+	 * txn->read_set[], and the high bit here) with an invertible uint16_t
+	 * index for each; the write set has a single bit per slot.
 	 *
-	 * each member of rs_words[] has the following format: high 8 bits
-	 * indicate chunk index, and low 8 are bits 11..4 of the in-chunk index
-	 * (aligned to 16).
+	 * each item in rs_words[] has the following format: high 8 bits indicate
+	 * chunk index, and low 8 are bits 11..4 of the in-chunk index (implied
+	 * zeroes in the lowest 4).
 	 */
-	uintptr_t read_set[BF_NUM_WORDS * 2], write_set[BF_NUM_WORDS];
+	uintptr_t read_set_hi[BF_NUM_WORDS];
 	uint16_t rs_words[BF_NUM_SLOTS];
 
 	/* data subject to concurrent access by other threads. */
@@ -328,8 +327,11 @@ int xn_begin(void)
 	c->txn->txnid = gen_txnid();
 	list_head_init(&c->txn->dtors);
 
-	for(int i=0; i < BF_NUM_WORDS * 2; i++) c->read_set[i] = 0;
-	for(int i=0; i < BF_NUM_WORDS; i++) c->write_set[i] = 0;
+	for(int i=0; i < BF_NUM_WORDS; i++) {
+		c->read_set_hi[i] = 0;
+		c->txn->write_set[i] = 0;
+		c->txn->read_set[i] = 0;
+	}
 	/* no need to clear the actual slots. */
 
 	/* see if the epoch scheme needs a spin, which it does if txnid + 1 has N
@@ -362,60 +364,6 @@ static void clean_client(struct xn_client *c)
 }
 
 
-/* squash src[4] to dst[2] by compressing 2-bit counts to 1-bit, with
- * saturation.
- *
- * it's almost certainly better to just store the read set in split fields,
- * than doing 6 copy-shift-ors per input word, or 24 total. a running
- * accumulator can usually fit under memory loads and/or stores.
- */
-static void compress_read_set(uintptr_t *dst, const uintptr_t *src)
-{
-	/* byte-sized broadcast, to make mask generation easier. */
-	const uintptr_t bcast = sizeof(uintptr_t) == 4
-		? 0x01010101ul : 0x0101010101010101ul;
-	const uintptr_t wmask = sizeof(uintptr_t) == 4
-		? 0x00ff00fful : 0x00ff00ff00ff00fful;
-	/* bit magic time! */
-	for(int i=0; i < BF_NUM_WORDS; i++) {
-		uintptr_t x = src[i*2 + 0], y = src[i*2 + 1];
-		x |= x >> 1;	/* squash counts. */
-		y |= y >> 1;
-		x &= bcast * 0x55; y &= bcast * 0x55;
-		x |= x >> 1; y |= y >> 1;	/* 0x0x -> 00xx */
-		x &= bcast * 0x33; y &= bcast * 0x33;
-		x |= x >> 2; y |= y >> 2;	/* 00xx00xx -> 0000xxxx */
-		x &= bcast * 0x0f; y &= bcast * 0x0f;
-		x |= x >> 4; y |= y >> 4;	/* 8 bits each */
-		x &= wmask; y &= wmask;
-		x |= x >> 8; y |= y >> 8;	/* 16 bits each. */
-#if __WORDSIZE == 64
-		const uintptr_t dmask = 0x0000ffff0000fffful;
-		x &= dmask; y &= dmask;
-		x |= x >> 16; y |= y >> 16;
-		dst[i] = (x & 0xfffffffful) | (y << 32);
-#else
-#error "not yet done for 32-bit"
-#endif
-	}
-
-#ifndef NDEBUG
-	for(int i=0; i < BF_NUM_WORDS * 2; i++) {
-		for(int j=0; j < __WORDSIZE / 2; j++) {
-			bool d_set = (dst[i / 2] & (1ul << ((i & 1) * 32 + j))) != 0,
-				s_set = (src[i] & (0x3ul << j * 2)) != 0;
-			if(d_set != s_set) {
-				printf("dst[%d]=%#lx, src[%d]=%#lx (i=%d, j=%d)\n",
-					i / 2, dst[i / 2], i, src[i], i, j);
-				printf("... d_set=%d, s_set=%d\n", (int)d_set, (int)s_set);
-			}
-			assert(d_set == s_set);
-		}
-	}
-#endif
-}
-
-
 int xn_commit(void)
 {
 	int rc, comm_id = gen_txnid();
@@ -428,8 +376,9 @@ int xn_commit(void)
 	txn = client->txn;
 	client->txn = NULL;
 	txn->commit_id = comm_id;
-	memcpy(txn->write_set, client->write_set, sizeof(txn->write_set));
-	compress_read_set(txn->read_set, client->read_set);
+	for(int i=0; i < BF_NUM_WORDS; i++) {
+		txn->read_set[i] |= client->read_set_hi[i];
+	}
 	uint32_t epoch = atomic_load_explicit(&client->epoch,
 		memory_order_consume);
 	struct xn_txn *old_txns[2] = {
@@ -632,7 +581,6 @@ static inline void probe_pos(int *slot, int *limb, int *ix, size_t hash)
 		mask = (1 << shift) - 1;
 
 	*slot = hash & (BF_NUM_SLOTS - 1);
-	hash *= 2;
 	*limb = (hash >> shift) & (BF_NUM_WORDS - 1);
 	*ix = hash & mask;
 }
@@ -647,10 +595,10 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 	int count[3], val[3];
 	struct xn_rec *rec[3];
 	for(int i=0; i < 3; i++) {
-		size_t hash = bf_hash(c, addr, i);
-		int limb, ix, slot;
-		probe_pos(&slot, &limb, &ix, hash);
-		count[i] = (c->read_set[limb] >> ix) & 0x3;
+		int slot, limb, ix;
+		probe_pos(&slot, &limb, &ix, bf_hash(c, addr, i));
+		count[i] = ((c->read_set_hi[limb] >> (ix - 1)) & 0x2)
+			| ((c->txn->read_set[limb] >> ix) & 0x1);
 		val[i] = c->rs_words[slot];
 
 		switch(count[i]) {
@@ -686,35 +634,28 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 }
 
 
+/* FIXME: this function doesn't behave as well as it could if two or more
+ * hashes land on the same slot.
+ */
 static void bf_insert(struct xn_client *c, void *addr, uint16_t rec_index)
 {
 	for(int i=0; i < 3; i++) {
 		size_t hash = bf_hash(c, addr, i);
 		int limb, ix, slot;
 		probe_pos(&slot, &limb, &ix, hash);
-		/* brute-force saturating increment. */
-		uintptr_t oldval = c->read_set[limb] & (0x3ul << ix);
-		if(oldval == 0) c->rs_words[slot] = 0;	/* lazy cleaning */
-		c->rs_words[slot] ^= rec_index;
-		if((~c->read_set[limb] & (0x3ul << ix)) != 0) {
-			c->read_set[limb] += 1ul << ix;
-		}
-#if 0
-		/* fancy two-bit saturating increment.
-		 * 00 -> 01, 01 -> 10, 10 -> 11, 11 -> 11;
+
+		/* fancy two-bit saturating increment & lazy cleanup.
+		 *
+		 * transform 00 -> 01, 01 -> 10, 10 -> 11, 11 -> 11;
 		 * so for H, L -> H|L, H|~L
 		 */
-		int a = c->read_set[limb] & (0x2 << (ix * 2)),
-			b = c->read_set[limb] & (0x1 << (ix * 2));
-		int h = a | (b << 1), l = (a >> 1) | (b ^ (1 << ix * 2));
-		/* FAJSLKFJALKSFJLKSAJFKSAJFLA: this isn't actually any faster than a
-		 * mask-test, jump, and add. if there were multiple items to be
-		 * incremented, maybe.
-		 */
-#endif
-		assert((c->read_set[limb] & (0x3ul << ix)) != 0);
-		assert(oldval < (c->read_set[limb] & (0x3ul << ix))
-			|| (oldval >> ix) == 0x3);
+		uintptr_t hi = c->read_set_hi[limb] & (1ul << ix),
+			lo = c->txn->read_set[limb] & (1ul << ix);
+		if((hi | lo) == 0) c->rs_words[slot] = 0;	/* clean */
+		c->rs_words[slot] ^= rec_index;
+		c->read_set_hi[limb] |= lo;
+		c->txn->read_set[limb] = (c->txn->read_set[limb] & ~(1ul << ix))
+			| hi | (lo ^ (1ul << ix));
 	}
 }
 
@@ -815,10 +756,9 @@ static void *xn_modify(void *ptr, size_t length)
 		 * note: [v1] this could recycle hashes computed for bf_insert().
 		 */
 		for(int i=0; i < 3; i++) {
-			uint32_t h = bf_hash(c, ptr, i);
-			int limb = (h >> (sizeof(uintptr_t) > 4 ? 6 : 5)) & 0x1,
-				bit = h & (sizeof(uintptr_t) > 4 ? 0x3f : 0x1f);
-			c->write_set[limb] |= 1ul << bit;
+			int slot, limb, ix;
+			probe_pos(&slot, &limb, &ix, bf_hash(c, ptr, i));
+			c->txn->write_set[limb] |= 1ul << ix;
 		}
 	}
 
