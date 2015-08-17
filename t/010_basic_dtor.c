@@ -91,8 +91,13 @@ int main(void)
 		if(tot == NUM_TXNS) free(p);	/* otherwise, leak */
 	}
 
-	ok1(dtor_total > NUM_THREADS);
-	ok1(dtor_max <= NUM_TXNS);
+	/* analysis. */
+	if(!ok1(dtor_total >= NUM_THREADS * NUM_TXNS / 2)) {
+		diag("dtor_total=%d", dtor_total);
+	}
+	if(!ok1(dtor_max <= NUM_TXNS)) {
+		diag("dtor_max=%d", dtor_max);
+	}
 
 	/* examine entrails. */
 	bool all_done = true;

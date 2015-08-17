@@ -3,7 +3,7 @@ CCAN_DIR=~/src/ccan
 
 CFLAGS:=-O2 -std=gnu11 -Wall -g -march=native \
 	-D_GNU_SOURCE -pthread -I $(CCAN_DIR) -I $(abspath .) \
-	-DCCAN_LIST_DEBUG=1 #-DNDEBUG
+	-DCCAN_LIST_DEBUG=1 #-DDEBUG_ME_HARDER
 
 TEST_BIN:=$(patsubst t/%.c,t/%,$(wildcard t/*.c))
 
@@ -29,7 +29,8 @@ tags: $(shell find . -iname "*.[ch]" -or -iname "*.p[lm]")
 
 
 t/%: t/%.o xn.o \
-		ccan-list.o ccan-htable.o ccan-hash.o ccan-tap.o
+		ccan-list.o ccan-htable.o ccan-hash.o ccan-tap.o \
+		ccan-talloc.o
 	@echo "  LD $@"
 	@$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
 
