@@ -634,15 +634,15 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 }
 
 
-/* FIXME: this function doesn't behave as well as it could if two or more
- * hashes land on the same slot.
- */
 static void bf_insert(struct xn_client *c, void *addr, uint16_t rec_index)
 {
+	int prior[3] = { -1, -1, -1 };
 	for(int i=0; i < 3; i++) {
 		size_t hash = bf_hash(c, addr, i);
 		int limb, ix, slot;
 		probe_pos(&slot, &limb, &ix, hash);
+		if(prior[0] == slot || prior[1] == slot) continue;
+		prior[i] = slot;
 
 		/* fancy two-bit saturating increment & lazy cleanup.
 		 *
