@@ -119,22 +119,15 @@ static uint32_t bloom_salt;
 
 /* the previous transactions' list. cleared with the epoch method, where ticks
  * happen when a (selected) beginning transaction notes that all active
- * clients have seen txn_epoch.
+ * clients have seen txn_epoch. this also drives the destructor mechanism.
  *
  * FIXME: txn_epoch doesn't handle roll-over. this is unfortunate, but
  * gen_txnid() and the txnid comparisons also don't handle roll-over, and
  * that'll always happen sooner -- so it doesn't matter for now.
  *
- * TODO: unfortunately this requires all client threads to be active at least
- * once before a tick can happen, and twice to clear a backlog caused by e.g.
- * a long absence. to solve this, add a "txnids under X are dead" rule, so
- * that a single client's extended inactivity will only cause its transaction
- * to fail instead of keeping useless memory around indefinitely.
- *
- * note that the proposed algorithm doesn't involve ticking the epoch forward
- * despite a client not having observed it. that could be done if each client
- * set a flag saying that the epoch must not tick, in addition to its observed
- * epoch; this'd defer epoch-tick processing.
+ * TODO: for now, clients sleeping within a transaction will retard epoch
+ * ticks indefinitely. that's unacceptable for e.g. distributed transaction
+ * processing.
  */
 static _Atomic uint32_t txn_epoch = 2;
 static volatile atomic_flag epoch_lock;
@@ -158,6 +151,8 @@ static pthread_mutex_t item_hash_lock = PTHREAD_MUTEX_INITIALIZER;
 static void destroy_xn_client(void *ptr);
 static size_t rehash_xn_item(const void *item, void *priv);
 static void finish_txn(struct xn_txn *txn);
+/* (TODO: rename to clean_txn()) */
+static void clean_client(struct xn_client *c);
 
 
 static inline int size_to_shift(size_t size) {
@@ -183,6 +178,8 @@ static void destroy_xn_client(void *ptr)
 	pthread_rwlock_wrlock(&client_list_lock);
 	list_del_from(&client_list, &c->link);
 	pthread_rwlock_unlock(&client_list_lock);
+
+	clean_client(c);
 	for(int i=0; i < c->rec_chunks.size; i++) {
 		free(c->rec_chunks.item[i].data);
 	}
@@ -262,6 +259,8 @@ static struct xn_item *get_item(void *ptr)
 /* move the epoch lists over and destroy the old dead-list's contents. */
 static void tick_txn_epoch(uint32_t old_epoch)
 {
+	assert((old_epoch & 0x80000000) == 0);
+
 	/* get the lock or go away. */
 	if(atomic_flag_test_and_set(&epoch_lock)) {
 		/* true = was already locked */
@@ -271,11 +270,13 @@ static void tick_txn_epoch(uint32_t old_epoch)
 	/* try to bump the epoch number, because another epoch-bumper may have
 	 * done its thing right before our test-and-set. on failure, back down.
 	 */
+	uint32_t new_epoch = old_epoch + 1;
+	if((new_epoch & 0x80000000) != 0) new_epoch = 2;
 	if(!atomic_compare_exchange_strong_explicit(&txn_epoch,
-		&old_epoch, old_epoch + 1, memory_order_relaxed,
+		&old_epoch, new_epoch, memory_order_relaxed,
 		memory_order_relaxed))
 	{
-		atomic_flag_clear(&epoch_lock);
+		atomic_flag_clear_explicit(&epoch_lock, memory_order_relaxed);
 		return;
 	}
 
@@ -299,9 +300,10 @@ static void check_txn_epoch(uint32_t cur_epoch)
 	pthread_rwlock_rdlock(&client_list_lock);
 	struct xn_client *c;
 	list_for_each(&client_list, c, link) {
-		if(atomic_load_explicit(&c->epoch,
-			memory_order_relaxed) != cur_epoch)
-		{
+		uint32_t c_epoch = atomic_load_explicit(&c->epoch,
+			memory_order_relaxed);
+		if((c_epoch & 0x80000000) != 0) continue;
+		else if(c_epoch != cur_epoch) {
 			all_seen = false;
 			break;
 		}
@@ -330,6 +332,7 @@ int xn_begin(void)
 	atomic_store_explicit(&c->epoch,
 		cur_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed),
 		memory_order_relaxed);
+	assert((cur_epoch & 0x80000000) == 0);
 	c->snapshot_valid = true;
 	c->txn = malloc(sizeof(struct xn_txn));
 	c->txn->txnid = gen_txnid();
@@ -343,10 +346,12 @@ int xn_begin(void)
 	/* no need to clear the actual slots. */
 
 	/* see if the epoch scheme needs a spin, which it does if txnid + 1 has N
-	 * lowest bits cleared, where 2^N >= 2 * client_count .
+	 * lowest bits cleared, where 2^N >= 2 * client_count ∧ N >= 3 .
 	 */
-	int mask = (1 << size_to_shift(2 * atomic_load_explicit(&client_count,
-		memory_order_relaxed))) - 1;
+	int shift = size_to_shift(2 * atomic_load_explicit(&client_count,
+		memory_order_relaxed));
+	if(shift < 3) shift = 3;
+	int mask = (1 << shift) - 1;
 	if(((c->txn->txnid + 1) & mask) == 0) check_txn_epoch(cur_epoch);
 
 	return 0;
@@ -355,6 +360,16 @@ int xn_begin(void)
 
 static void clean_client(struct xn_client *c)
 {
+	/* the "end" bracket of the epoch mechanism. this lets the epoch tick
+	 * forward freely even if this thread never starts another transaction
+	 * again. consumers recognize that the high bit is set and ignore the
+	 * client.
+	 */
+	atomic_store_explicit(&c->epoch,
+		atomic_load_explicit(&txn_epoch,
+			memory_order_relaxed) | 0x80000000,
+		memory_order_release);
+
 	if(c->txn != NULL) {
 		struct xn_dtor *cur, *next;
 		list_for_each_safe(&c->txn->dtors, cur, next, link) {
@@ -464,8 +479,8 @@ int xn_commit(void)
 	rc = 0;
 
 end:
-	clean_client(client);
 	darray_free(w_list);
+	clean_client(client);
 	return rc;
 
 serfail:

@@ -81,7 +81,6 @@ static sem_t *mksem(void *context, unsigned int startval)
 int main(void)
 {
 	plan_tests(2);
-	todo_start("not expected to work yet");
 
 	/* allocate data and control structures, and spawn threads. */
 	int *data = talloc_zero_array(NULL, int, NUM_THREADS);
