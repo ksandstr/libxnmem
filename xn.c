@@ -39,6 +39,10 @@
 #define BF_NUM_SLOTS (1 << BF_SIZE_LOG2)
 #define BF_NUM_WORDS (BF_NUM_SLOTS / (sizeof(uintptr_t) * 8))
 
+#define TXNID_SUSPECT (1 << 24)
+#define TXNID_KILLED (1 << 25)
+#define TXNID_COMMIT (1 << 26)
+
 
 struct xn_chunk {
 	uint16_t next_pos;
@@ -111,6 +115,18 @@ struct xn_client
 	/* data subject to concurrent access by other threads. */
 	_Atomic uint32_t epoch ALIGN_TO_CACHELINE;
 	struct list_node link;	/* in client_list, under client_list_lock */
+	/* while the transaction is unpublished, txnid's high 8 bits are assigned
+	 * thus:
+	 *   24: "suspect" bit. set if the transaction has been open for
+	 *       so long as to prevent epoch ticks.
+	 *   25: "killed" bit. set if the suspect bit would've been set twice.
+	 *       xn_commit() will abort the transaction with -ETIMEDOUT.
+	 *   26: "commit" bit. when set, "suspect" and "killed" won't be.
+	 *
+	 * at publication, txnid is copied into txn->txnid with high 8 bits set to
+	 * zero.
+	 */
+	_Atomic int txnid;
 };
 
 
@@ -124,10 +140,6 @@ static uint32_t bloom_salt;
  * FIXME: txn_epoch doesn't handle roll-over. this is unfortunate, but
  * gen_txnid() and the txnid comparisons also don't handle roll-over, and
  * that'll always happen sooner -- so it doesn't matter for now.
- *
- * TODO: for now, clients sleeping within a transaction will retard epoch
- * ticks indefinitely. that's unacceptable for e.g. distributed transaction
- * processing.
  */
 static _Atomic uint32_t txn_epoch = 2;
 static volatile atomic_flag epoch_lock;
@@ -167,7 +179,7 @@ static void mod_init_fn(void)
 	htable_init(&item_hash, &rehash_xn_item, NULL);
 	bloom_salt = 0x1234abcd;	/* TODO: generate a random number */
 	for(int i=0; i < 4; i++) txn_list[i] = NULL;
-	atomic_flag_clear(&epoch_lock);
+	atomic_flag_clear_explicit(&epoch_lock, memory_order_relaxed);
 }
 
 
@@ -294,6 +306,39 @@ static void tick_txn_epoch(uint32_t old_epoch)
 }
 
 
+/* try to kill a suspiciously long open transaction. returns true if the
+ * transaction is now dead.
+ */
+static bool try_kill_txn(struct xn_client *c)
+{
+	bool dead;
+	int new_txnid, old_txnid = atomic_load_explicit(
+		&c->txnid, memory_order_relaxed);
+	do {
+		new_txnid = old_txnid;
+		if((old_txnid & TXNID_COMMIT) != 0) {
+			/* can't tick or kill: a client is in the middle of
+			 * xn_commit().
+			 */
+			dead = false;
+		} else if((old_txnid & TXNID_KILLED) != 0) {
+			dead = true;
+		} else if((old_txnid & TXNID_SUSPECT) != 0) {
+			new_txnid |= TXNID_KILLED;
+			new_txnid &= ~TXNID_SUSPECT;
+			dead = true;
+		} else {
+			new_txnid |= TXNID_SUSPECT;
+			dead = false;
+		}
+		if(old_txnid == new_txnid) break;
+	} while(!atomic_compare_exchange_weak_explicit(&c->txnid,
+		&old_txnid, new_txnid, memory_order_release, memory_order_relaxed));
+
+	return dead;
+}
+
+
 static void check_txn_epoch(uint32_t cur_epoch)
 {
 	bool all_seen = true;
@@ -304,8 +349,8 @@ static void check_txn_epoch(uint32_t cur_epoch)
 			memory_order_relaxed);
 		if((c_epoch & 0x80000000) != 0) continue;
 		else if(c_epoch != cur_epoch) {
+			if(try_kill_txn(c)) continue;
 			all_seen = false;
-			break;
 		}
 	}
 	pthread_rwlock_unlock(&client_list_lock);
@@ -330,7 +375,7 @@ int xn_begin(void)
 	assert(c->txn == NULL);
 	c->snapshot_valid = true;
 	c->txn = malloc(sizeof(struct xn_txn));
-	c->txn->txnid = gen_txnid();
+	c->txnid = gen_txnid();
 	list_head_init(&c->txn->dtors);
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		c->read_set_hi[i] = 0;
@@ -353,7 +398,7 @@ int xn_begin(void)
 		memory_order_relaxed));
 	if(shift < 3) shift = 3;
 	int mask = (1 << shift) - 1;
-	if(((c->txn->txnid + 1) & mask) == 0) check_txn_epoch(cur_epoch);
+	if(((c->txnid + 1) & mask) == 0) check_txn_epoch(cur_epoch);
 
 	return 0;
 }
@@ -366,18 +411,17 @@ static void clean_client(struct xn_client *c)
 	 * again. consumers recognize that the high bit is set and ignore the
 	 * client.
 	 */
-	atomic_store_explicit(&c->epoch,
-		atomic_load_explicit(&txn_epoch,
-			memory_order_relaxed) | 0x80000000,
-		memory_order_release);
+	atomic_fetch_or_explicit(&c->epoch, 0x80000000, memory_order_release);
 
-	if(c->txn != NULL) {
+	struct xn_txn *txn = atomic_exchange_explicit(&c->txn, NULL,
+		memory_order_relaxed);
+	if(txn != NULL) {
 		struct xn_dtor *cur, *next;
-		list_for_each_safe(&c->txn->dtors, cur, next, link) {
-			list_del_from(&c->txn->dtors, &cur->link);
+		list_for_each_safe(&txn->dtors, cur, next, link) {
+			list_del_from(&txn->dtors, &cur->link);
 			free(cur);
 		}
-		free(c->txn); c->txn = NULL;
+		free(txn);
 	}
 
 	for(int i=1; i < c->rec_chunks.size; i++) {
@@ -390,21 +434,37 @@ static void clean_client(struct xn_client *c)
 
 int xn_commit(void)
 {
-	int rc, comm_id = gen_txnid();
+	int rc, comm_id;
 	darray(struct xn_rec *) w_list = darray_new();
 	struct xn_txn *txn = NULL;
 
 	struct xn_client *client = get_client();
 	if(!client->snapshot_valid) goto serfail;
 
-	txn = client->txn;
-	client->txn = NULL;
+	if((client->txnid & TXNID_KILLED) != 0) goto timeout;
+	comm_id = gen_txnid();
+	uint32_t txnid = atomic_fetch_or_explicit(&client->txnid,
+		TXNID_COMMIT, memory_order_relaxed);
+	if((txnid & TXNID_KILLED) != 0) {
+#if 0
+		printf("%s: async kill of txnid=%#x (comm=%#x, epoch delta=%d)\n",
+			__func__, txnid, comm_id,
+			(int)atomic_load(&txn_epoch) - client->epoch);
+#endif
+		goto timeout;
+	}
+	txn = atomic_exchange_explicit(&client->txn, NULL,
+		memory_order_acq_rel);
+	if(txn == NULL) goto serfail;
+	txn->txnid = txnid & 0xffffff;
 	txn->commit_id = comm_id;
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		txn->read_set[i] |= client->read_set_hi[i];
 	}
 	uint32_t epoch = atomic_load_explicit(&client->epoch,
 		memory_order_consume);
+	assert(epoch == atomic_load(&txn_epoch)
+		|| epoch + 1 == atomic_load(&txn_epoch));
 	struct xn_txn *old_txns[2] = {
 		atomic_load_explicit(&txn_list[epoch & 3], memory_order_relaxed),
 		atomic_load_explicit(&txn_list[(epoch - 1) & 3], memory_order_relaxed),
@@ -493,6 +553,10 @@ serfail:
 	}
 	free(txn);
 	rc = -EDEADLK;
+	goto end;
+
+timeout:
+	rc = -ETIMEDOUT;
 	goto end;
 }
 
@@ -742,7 +806,7 @@ int xn_read_int(int *iptr)
 	rec->length = sizeof(int);
 	rec->is_write = false;
 	rec->version = old_ver;
-	if(rec->version > c->txn->txnid) c->snapshot_valid = false;
+	if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
 	memcpy(rec->data, &value, sizeof(int));
 	bf_insert(c, iptr, idx);
 	assert(find_item_rec(c, iptr) == rec);
@@ -770,7 +834,7 @@ static void *xn_modify(void *ptr, size_t length)
 		 * transaction will be aborted anyway.)
 		 */
 		rec->version = ACCESS_ONCE(rec->item->version) & 0xffffff;
-		if(rec->version > c->txn->txnid) c->snapshot_valid = false;
+		if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
 		bf_insert(c, ptr, rec_idx);
 	}
 

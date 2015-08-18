@@ -6,7 +6,7 @@
 #include <errno.h>
 
 
-#define XN_RESTART(status) ((status) == -EDEADLK)
+#define XN_RESTART(status) ((status) == -EDEADLK || (status) == -ETIMEDOUT)
 
 
 extern int xn_begin(void);
