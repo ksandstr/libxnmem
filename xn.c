@@ -328,22 +328,23 @@ int xn_begin(void)
 
 	struct xn_client *c = get_client();
 	assert(c->txn == NULL);
-	uint32_t cur_epoch;
-	atomic_store_explicit(&c->epoch,
-		cur_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed),
-		memory_order_relaxed);
-	assert((cur_epoch & 0x80000000) == 0);
 	c->snapshot_valid = true;
 	c->txn = malloc(sizeof(struct xn_txn));
 	c->txn->txnid = gen_txnid();
 	list_head_init(&c->txn->dtors);
-
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		c->read_set_hi[i] = 0;
 		c->txn->write_set[i] = 0;
 		c->txn->read_set[i] = 0;
 	}
 	/* no need to clear the actual slots. */
+	atomic_store_explicit(&c->txn->txnid, gen_txnid(), memory_order_relaxed);
+	/* begin epoch-protected section. */
+	uint32_t cur_epoch;
+	atomic_store_explicit(&c->epoch,
+		cur_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed),
+		memory_order_release);
+	assert((cur_epoch & 0x80000000) == 0);
 
 	/* see if the epoch scheme needs a spin, which it does if txnid + 1 has N
 	 * lowest bits cleared, where 2^N >= 2 * client_count ∧ N >= 3 .
