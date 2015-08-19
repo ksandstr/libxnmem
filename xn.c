@@ -65,9 +65,8 @@ struct xn_rec
 };
 
 
-/* destructor closure inna list. */
+/* destructor closure. */
 struct xn_dtor {
-	struct list_node link;		/* in xn_txn.dtors */
 	void (*dtor_fn)(void *param);
 	void *param;
 };
@@ -85,7 +84,7 @@ struct xn_txn
 	 * exact same format as write_set[] once published.
 	 */
 	uintptr_t read_set[BF_NUM_WORDS], write_set[BF_NUM_WORDS];
-	struct list_head dtors;			/* <struct xn_dtor>, malloc'd */
+	darray(struct xn_dtor) dtors;
 };
 
 
@@ -376,7 +375,7 @@ int xn_begin(void)
 	c->snapshot_valid = true;
 	c->txn = malloc(sizeof(struct xn_txn));
 	c->txnid = gen_txnid();
-	list_head_init(&c->txn->dtors);
+	darray_init(c->txn->dtors);
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		c->read_set_hi[i] = 0;
 		c->txn->write_set[i] = 0;
@@ -416,11 +415,7 @@ static void clean_client(struct xn_client *c)
 	struct xn_txn *txn = atomic_exchange_explicit(&c->txn, NULL,
 		memory_order_relaxed);
 	if(txn != NULL) {
-		struct xn_dtor *cur, *next;
-		list_for_each_safe(&txn->dtors, cur, next, link) {
-			list_del_from(&txn->dtors, &cur->link);
-			free(cur);
-		}
+		darray_free(txn->dtors);
 		free(txn);
 	}
 
@@ -440,9 +435,8 @@ int xn_commit(void)
 
 	struct xn_client *client = get_client();
 	if(!client->snapshot_valid) goto serfail;
-
 	if((client->txnid & TXNID_KILLED) != 0) goto timeout;
-	comm_id = gen_txnid();
+
 	uint32_t txnid = atomic_fetch_or_explicit(&client->txnid,
 		TXNID_COMMIT, memory_order_relaxed);
 	if((txnid & TXNID_KILLED) != 0) {
@@ -453,6 +447,7 @@ int xn_commit(void)
 #endif
 		goto timeout;
 	}
+	comm_id = gen_txnid();
 	txn = atomic_exchange_explicit(&client->txn, NULL,
 		memory_order_acq_rel);
 	if(txn == NULL) goto serfail;
@@ -551,7 +546,10 @@ serfail:
 		atomic_fetch_and_explicit(&rec->item->version,
 			~ITEM_WRITE_BIT, memory_order_relaxed);
 	}
-	free(txn);
+	if(txn != NULL) {
+		darray_free(txn->dtors);
+		free(txn);
+	}
 	rc = -EDEADLK;
 	goto end;
 
@@ -569,12 +567,10 @@ static void finish_txn(struct xn_txn *txn)
 	}
 #endif
 
-	struct xn_dtor *cur, *next;
-	list_for_each_safe(&txn->dtors, cur, next, link) {
-		list_del_from(&txn->dtors, &cur->link);
-		(*cur->dtor_fn)(cur->param);
-		free(cur);
+	for(int i=0; i < txn->dtors.size; i++) {
+		(*txn->dtors.item[i].dtor_fn)(txn->dtors.item[i].param);
 	}
+	darray_free(txn->dtors);
 
 	free(txn);
 }
@@ -594,10 +590,8 @@ void xn_abort(int status)
 void xn_dtor(void (*fn)(void *param), void *param)
 {
 	struct xn_client *c = get_client();
-	struct xn_dtor *d = malloc(sizeof(*d));
-	d->dtor_fn = fn;
-	d->param = param;
-	list_add_tail(&c->txn->dtors, &d->link);
+	struct xn_dtor d = { .dtor_fn = fn, .param = param };
+	darray_push(c->txn->dtors, d);
 }
 
 
