@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <assert.h>
 
 #include <ccan/list/list.h>
@@ -782,17 +783,18 @@ int xn_read_int(int *iptr)
 	struct xn_item *it = get_item(iptr);
 	int value, old_ver, new_ver;
 	do {
+		int n_loops = 0;
 		while(((new_ver = atomic_load_explicit(&it->version,
-			memory_order_relaxed)) & ITEM_WRITE_BIT) != 0)
+			memory_order_acquire)) & ITEM_WRITE_BIT) != 0)
 		{
-			/* sit & spin */
+			if(n_loops == 40) sched_yield(); else n_loops++;
 		}
 		do {
 			if((new_ver & ITEM_WRITE_BIT) != 0) break;
 			old_ver = new_ver;
-			value = atomic_load_explicit(iptr, memory_order_acquire);
+			value = atomic_load_explicit(iptr, memory_order_relaxed);
 		} while((new_ver = atomic_load_explicit(&it->version,
-			memory_order_relaxed)) != old_ver);
+			memory_order_seq_cst)) != old_ver);
 	} while((new_ver & ITEM_WRITE_BIT) != 0);
 
 	/* make new record. */
