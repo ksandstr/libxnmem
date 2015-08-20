@@ -426,6 +426,37 @@ static void clean_client(struct xn_client *c)
 }
 
 
+/* insert txn into txn_list in order of descending commit ID so that the query
+ * loop can early-exit.
+ */
+static void insert_txn(struct xn_txn *_Atomic *list_p, struct xn_txn *txn)
+{
+	struct xn_txn *head = atomic_load_explicit(list_p, memory_order_consume);
+	if(head != NULL && head->commit_id > txn->commit_id) {
+		insert_txn(&head->next, txn);
+	} else {
+		/* become the new head, or retry. */
+		txn->next = head;
+		if(!atomic_compare_exchange_strong_explicit(list_p,
+			&head, txn, memory_order_release, memory_order_consume))
+		{
+			insert_txn(list_p, txn);
+		}
+	}
+
+#ifdef DEBUG_ME_HARDER
+	uint32_t last = ~0u;
+	for(struct xn_txn *cur = atomic_load(list_p);
+		cur != NULL;
+		cur = atomic_load(&cur->next))
+	{
+		assert(cur->commit_id < last);
+		last = cur->commit_id;
+	}
+#endif
+}
+
+
 int xn_commit(void)
 {
 	int rc, comm_id;
@@ -467,9 +498,18 @@ int xn_commit(void)
 	for(int lst = 0; lst < 2; lst++) {
 		for(struct xn_txn *cur = old_txns[lst];
 			cur != NULL;
-			cur = atomic_load_explicit(&cur->next, memory_order_consume))
+			cur = atomic_load_explicit(&cur->next, memory_order_relaxed))
 		{
-			if(cur->commit_id < txn->txnid) continue;
+			if(cur->commit_id < txn->txnid) {
+#ifndef NDEBUG
+				while(cur != NULL) {
+					assert(cur->commit_id < txn->txnid);
+					cur = atomic_load(&cur->next);
+				}
+#endif
+				break;
+			}
+
 			bool w_match = false, r_match = false;
 			for(int i=0; i < BF_NUM_WORDS; i++) {
 				w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
@@ -512,16 +552,7 @@ int xn_commit(void)
 		finish_txn(txn);
 		atomic_thread_fence(memory_order_release);
 	} else {
-		/* FIXME: this should insert txn into txn_list in order of descending
-		 * commit ID so that the query loop can early-exit.
-		 */
-		txn->next = atomic_load_explicit(&txn_list[epoch & 3],
-			memory_order_consume);
-		while(!atomic_compare_exchange_weak_explicit(&txn_list[epoch & 3],
-			&txn->next, txn, memory_order_release, memory_order_consume))
-		{
-			/* sit & spin */
-		}
+		insert_txn(&txn_list[epoch & 3], txn);
 
 		atomic_thread_fence(memory_order_acquire);
 		/* hooray, let's committing! */
@@ -530,7 +561,7 @@ int xn_commit(void)
 			memcpy(rec->item->address, rec->data, rec->length);
 		}
 		atomic_thread_fence(memory_order_release);
-		/* unlock in relaxed order. */
+		/* unlock whenever. */
 		for(int i=0; i < w_list.size; i++) {
 			struct xn_rec *rec = w_list.item[i];
 			atomic_store_explicit(&rec->item->version, comm_id,
