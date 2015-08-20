@@ -22,9 +22,6 @@
 #include "xn.h"
 
 
-/* TODO: remove this in favour of C11 atomic loads */
-#define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
-
 #define MSB(x) (sizeof((x)) * 8 - __builtin_clzl((x)) - 1)
 #define ALIGN_TO_CACHELINE __attribute__((aligned(64)))
 
@@ -44,15 +41,9 @@
 #define TXNID_COMMIT (1 << 26)
 
 
-struct xn_chunk {
-	uint16_t next_pos;
-	void *data;
-};
-
-
 struct xn_item {
 	void *address;
-	uint32_t version;	/* 24: write bit, 23..0: version (txnid) */
+	_Atomic uint32_t version;	/* 24: writelock bit, 23..0: version (txnid) */
 };
 
 
@@ -85,6 +76,13 @@ struct xn_txn
 	 */
 	uintptr_t read_set[BF_NUM_WORDS], write_set[BF_NUM_WORDS];
 	darray(struct xn_dtor) dtors;
+};
+
+
+/* transaction log chunk in xn_client */
+struct xn_chunk {
+	uint16_t next_pos;
+	void *data;
 };
 
 
@@ -345,7 +343,7 @@ static void check_txn_epoch(uint32_t cur_epoch)
 	struct xn_client *c;
 	list_for_each(&client_list, c, link) {
 		uint32_t c_epoch = atomic_load_explicit(&c->epoch,
-			memory_order_relaxed);
+			memory_order_consume);
 		if((c_epoch & 0x80000000) != 0) continue;
 		else if(c_epoch != cur_epoch) {
 			if(try_kill_txn(c)) continue;
@@ -490,7 +488,8 @@ int xn_commit(void)
 			struct xn_rec *rec = ck->data + pos;
 			pos += (sizeof(struct xn_rec) + rec->length + 15) & ~15;
 
-			int v_seen = ACCESS_ONCE(rec->item->version);
+			int v_seen = atomic_load_explicit(&rec->item->version,
+				memory_order_relaxed);
 			assert((rec->version & ITEM_WRITE_BIT) == 0);
 			if(v_seen != rec->version) goto serfail;
 			if(rec->is_write) {
@@ -783,14 +782,17 @@ int xn_read_int(int *iptr)
 	struct xn_item *it = get_item(iptr);
 	int value, old_ver, new_ver;
 	do {
-		while(((new_ver = ACCESS_ONCE(it->version)) & ITEM_WRITE_BIT) != 0) {
+		while(((new_ver = atomic_load_explicit(&it->version,
+			memory_order_relaxed)) & ITEM_WRITE_BIT) != 0)
+		{
 			/* sit & spin */
 		}
 		do {
 			if((new_ver & ITEM_WRITE_BIT) != 0) break;
 			old_ver = new_ver;
 			value = atomic_load_explicit(iptr, memory_order_acquire);
-		} while((new_ver = ACCESS_ONCE(it->version)) != old_ver);
+		} while((new_ver = atomic_load_explicit(&it->version,
+			memory_order_relaxed)) != old_ver);
 	} while((new_ver & ITEM_WRITE_BIT) != 0);
 
 	/* make new record. */
@@ -827,7 +829,8 @@ static void *xn_modify(void *ptr, size_t length)
 		/* (not caring about concurrent writes! if one was in progress, this
 		 * transaction will be aborted anyway.)
 		 */
-		rec->version = ACCESS_ONCE(rec->item->version) & 0xffffff;
+		rec->version = atomic_load_explicit(&rec->item->version,
+			memory_order_relaxed) & 0xffffff;
 		if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
 		bf_insert(c, ptr, rec_idx);
 	}
