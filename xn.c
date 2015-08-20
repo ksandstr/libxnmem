@@ -506,17 +506,23 @@ int xn_commit(void)
 		}
 	}
 
-	/* FIXME: this should insert txn into txn_list in order of descending
-	 * commit ID so that the query loop can early-exit.
-	 */
-	txn->next = atomic_load_explicit(&txn_list[epoch & 3], memory_order_consume);
-	while(!atomic_compare_exchange_weak_explicit(&txn_list[epoch & 3],
-		&txn->next, txn, memory_order_release, memory_order_consume))
-	{
-		/* sit & spin */
-	}
+	rc = 0;
+	if(w_list.size == 0) {
+		/* read-only: cannot participate in deadlocks. */
+		finish_txn(txn);
+		atomic_thread_fence(memory_order_release);
+	} else {
+		/* FIXME: this should insert txn into txn_list in order of descending
+		 * commit ID so that the query loop can early-exit.
+		 */
+		txn->next = atomic_load_explicit(&txn_list[epoch & 3],
+			memory_order_consume);
+		while(!atomic_compare_exchange_weak_explicit(&txn_list[epoch & 3],
+			&txn->next, txn, memory_order_release, memory_order_consume))
+		{
+			/* sit & spin */
+		}
 
-	if(w_list.size > 0) {
 		atomic_thread_fence(memory_order_acquire);
 		/* hooray, let's committing! */
 		for(int i=0; i < w_list.size; i++) {
@@ -531,8 +537,6 @@ int xn_commit(void)
 				memory_order_relaxed);
 		}
 	}
-
-	rc = 0;
 
 end:
 	darray_free(w_list);
