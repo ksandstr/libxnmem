@@ -544,13 +544,14 @@ int xn_commit(void)
 			struct xn_rec *rec = ck->data + pos;
 			pos += (sizeof(struct xn_rec) + rec->length + 15) & ~15;
 
-			int v_seen = atomic_load_explicit(&rec->item->version,
-				memory_order_relaxed);
+			int v_value = atomic_load_explicit(&rec->item->version,
+					memory_order_relaxed),
+				v_seen = v_value & 0xffffff;
 			assert((rec->version & ITEM_WRITE_BIT) == 0);
 			if(v_seen != rec->version) goto serfail;
 			if(rec->is_write) {
 				if(!atomic_compare_exchange_strong_explicit(
-					&rec->item->version, &v_seen, comm_id | ITEM_WRITE_BIT,
+					&rec->item->version, &v_value, comm_id | ITEM_WRITE_BIT,
 					memory_order_relaxed, memory_order_relaxed))
 				{
 					/* changed between read and write. */
@@ -853,7 +854,7 @@ int xn_read_int(int *iptr)
 	rec->item = (struct xn_item *)it;
 	rec->length = sizeof(int);
 	rec->is_write = false;
-	rec->version = old_ver;
+	rec->version = old_ver & 0xffffff;
 	if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
 	memcpy(rec->data, &value, sizeof(int));
 	bf_insert(c, iptr, idx);
