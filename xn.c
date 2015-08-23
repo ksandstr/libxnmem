@@ -177,7 +177,7 @@ static void mod_init_fn(void)
 	htable_init(&item_hash, &rehash_xn_item, NULL);
 	bloom_salt = 0x1234abcd;	/* TODO: generate a random number */
 	for(int i=0; i < 4; i++) txn_list[i] = NULL;
-	atomic_flag_clear_explicit(&epoch_lock, memory_order_relaxed);
+	atomic_flag_clear_explicit(&epoch_lock, memory_order_release);
 }
 
 
@@ -306,14 +306,20 @@ static void tick_txn_epoch(uint32_t old_epoch)
 
 /* try to kill a suspiciously long open transaction. returns true if the
  * transaction is now dead.
+ *
+ * TODO: the algorithm between this function and check_txn_epoch() effectively
+ * kills transactions even when doing so doesn't result in an epoch tick.
+ * for now, it starts killing eagerly and then switches to not-killing if it
+ * sees one client that wasn't suspect already.
  */
-static bool try_kill_txn(struct xn_client *c)
+static bool try_kill_txn(struct xn_client *c, bool *active_seen_p)
 {
-	bool dead;
+	bool dead, avoid;
 	int new_txnid, old_txnid = atomic_load_explicit(
 		&c->txnid, memory_order_relaxed);
 	do {
 		new_txnid = old_txnid;
+		avoid = *active_seen_p;
 		if((old_txnid & TXNID_COMMIT) != 0) {
 			/* can't tick or kill: a client is in the middle of
 			 * xn_commit().
@@ -322,10 +328,18 @@ static bool try_kill_txn(struct xn_client *c)
 		} else if((old_txnid & TXNID_KILLED) != 0) {
 			dead = true;
 		} else if((old_txnid & TXNID_SUSPECT) != 0) {
-			new_txnid |= TXNID_KILLED;
-			new_txnid &= ~TXNID_SUSPECT;
-			dead = true;
+			if(avoid) {
+				/* avoidance mode. */
+				dead = false;
+				break;
+			} else {
+				new_txnid |= TXNID_KILLED;
+				new_txnid &= ~TXNID_SUSPECT;
+				dead = true;
+			}
 		} else {
+			/* enter avoidance mode. */
+			avoid = true;
 			new_txnid |= TXNID_SUSPECT;
 			dead = false;
 		}
@@ -333,13 +347,14 @@ static bool try_kill_txn(struct xn_client *c)
 	} while(!atomic_compare_exchange_weak_explicit(&c->txnid,
 		&old_txnid, new_txnid, memory_order_release, memory_order_relaxed));
 
+	*active_seen_p = avoid;
 	return dead;
 }
 
 
 static void check_txn_epoch(uint32_t cur_epoch)
 {
-	bool all_seen = true;
+	bool all_seen = true, active_seen = false;
 	pthread_rwlock_rdlock(&client_list_lock);
 	struct xn_client *c;
 	list_for_each(&client_list, c, link) {
@@ -347,7 +362,7 @@ static void check_txn_epoch(uint32_t cur_epoch)
 			memory_order_consume);
 		if((c_epoch & 0x80000000) != 0) continue;
 		else if(c_epoch != cur_epoch) {
-			if(try_kill_txn(c)) continue;
+			if(try_kill_txn(c, &active_seen)) continue;
 			all_seen = false;
 		}
 	}
@@ -464,6 +479,7 @@ int xn_commit(void)
 	struct xn_txn *txn = NULL;
 
 	struct xn_client *client = get_client();
+	assert(client->txn != NULL);
 	if(!client->snapshot_valid) goto serfail;
 
 	uint32_t txnid = atomic_fetch_or_explicit(&client->txnid,
@@ -471,7 +487,7 @@ int xn_commit(void)
 	if((txnid & TXNID_KILLED) != 0) {
 #if 0
 		printf("%s: async kill of txnid=%#x (comm=%#x, epoch delta=%d)\n",
-			__func__, txnid, comm_id,
+			__func__, txnid & 0xffffff, comm_id,
 			(int)atomic_load(&txn_epoch) - client->epoch);
 #endif
 		goto timeout;
