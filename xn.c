@@ -465,7 +465,6 @@ int xn_commit(void)
 
 	struct xn_client *client = get_client();
 	if(!client->snapshot_valid) goto serfail;
-	if((client->txnid & TXNID_KILLED) != 0) goto timeout;
 
 	uint32_t txnid = atomic_fetch_or_explicit(&client->txnid,
 		TXNID_COMMIT, memory_order_relaxed);
