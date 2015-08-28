@@ -142,11 +142,12 @@ static uint32_t bloom_salt;
 static _Atomic uint32_t txn_epoch = 2;
 static volatile atomic_flag epoch_lock;
 /* [txn_epoch + 1 mod 4] = NULL
- * [txn_epoch     mod 4] = committed txns (r/w by xn_commit());
- * [txn_epoch - 1 mod 4] = pre-dead txns (r by xn_commit());
+ * [txn_epoch     mod 4] = committed txns (r/w in xn_commit());
+ * [txn_epoch - 1 mod 4] = pre-dead txns (r in xn_commit() old epoch);
  * [txn_epoch - 2 mod 4] = dead txns
  *
- * bumping the epoch requires that the next slot has been cleared.
+ * therefore slot +0 is the live txn list, and -1, -2, and +1 are the epoch
+ * deadlists.
  */
 static struct xn_txn *_Atomic txn_list[4];
 
@@ -577,7 +578,7 @@ int xn_commit(void)
 		finish_txn(txn);
 		atomic_thread_fence(memory_order_release);
 	} else {
-		insert_txn(&txn_list[epoch & 3], txn);
+		insert_txn(&txn_list[g_epoch & 3], txn);
 
 		atomic_thread_fence(memory_order_acquire);
 		/* hooray, let's committing! */
