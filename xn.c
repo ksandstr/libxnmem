@@ -501,16 +501,25 @@ int xn_commit(void)
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		txn->read_set[i] |= client->read_set_hi[i];
 	}
-	uint32_t epoch = atomic_load_explicit(&client->epoch,
-		memory_order_consume);
-	assert(epoch == atomic_load(&txn_epoch)
-		|| epoch + 1 == atomic_load(&txn_epoch));
-	struct xn_txn *old_txns[2] = {
-		atomic_load_explicit(&txn_list[epoch & 3], memory_order_relaxed),
-		atomic_load_explicit(&txn_list[(epoch - 1) & 3], memory_order_relaxed),
-	};
+	uint32_t epoch = atomic_load_explicit(
+			&client->epoch, memory_order_consume),
+		g_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed);
+	assert(epoch == g_epoch || epoch + 1 == g_epoch);
+
+	/* examine old transactions in our epoch, and possibly the next if the
+	 * tick happened concurrently.
+	 */
+	int n_olds = 0;
+	struct xn_txn *old_txns[2];
+	if(g_epoch > epoch) {
+		old_txns[n_olds++] = atomic_load_explicit(
+			&txn_list[g_epoch & 3], memory_order_relaxed);
+	}
+	old_txns[n_olds++] = atomic_load_explicit(
+		&txn_list[epoch & 3], memory_order_relaxed);
+
 	/* the bloom-filter intersection test for read-to-write dependency. */
-	for(int lst = 0; lst < 2; lst++) {
+	for(int lst = 0; lst < n_olds; lst++) {
 		for(struct xn_txn *cur = old_txns[lst];
 			cur != NULL;
 			cur = atomic_load_explicit(&cur->next, memory_order_relaxed))
