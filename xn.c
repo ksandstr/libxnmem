@@ -736,8 +736,8 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 {
 	*ambig_p = false;
 	int count[3], val[3];
-	struct xn_rec *rec[3];
-	for(int i=0; i < 3; i++) {
+	struct xn_rec *rec = NULL;
+	for(int i=0; i < 3 && rec == NULL; i++) {
 		int slot, limb, ix;
 		probe_pos(&slot, &limb, &ix, bf_hash(c, addr, i));
 		count[i] = ((c->read_set_hi[limb] >> (ix - 1)) & 0x2)
@@ -745,35 +745,25 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 		val[i] = c->rs_words[slot];
 
 		switch(count[i]) {
-			case 0: return NULL;		/* strongly absent. */
+			case 0:
+				/* strongly absent. */
+				return NULL;
 			case 1:
 				/* absent if invalid, or wrong item. */
 				if(!is_valid_index(c, val[i])) return NULL;
-				rec[i] = index_to_rec(c, val[i]);
-				if(rec[i]->item->address != addr) return NULL;
+				rec = index_to_rec(c, val[i]);
+				if(rec->item->address != addr) return NULL;
 				break;
 			case 2:
-				/* TODO: store val[i] ^= val[0], if possible */
-				/* (in the mean time, FALL THRU) */
 			case 3:
 				/* uncertain. */
-				rec[i] = NULL;
 				break;
 		}
 	}
 
-	/* pick the median. */
-	struct xn_rec *ret = NULL;
-	if(rec[0] == rec[1] || rec[0] == rec[2]) ret = rec[0];
-	if(ret == NULL || rec[1] == rec[2]) ret = rec[1];
-	if(ret == NULL) {
-		/* no quorum. */
-		*ambig_p = true;
-		return NULL;
-	}
-
-	assert(ret->item->address == addr);
-	return ret;
+	if(rec == NULL) *ambig_p = true;	/* needs extended lookup */
+	assert(rec == NULL || rec->item->address == addr);
+	return rec;
 }
 
 
