@@ -375,7 +375,7 @@ static void check_txn_epoch(uint32_t cur_epoch)
 /* TODO: this should handle roll-over. currently it does not. */
 static int gen_txnid(void)
 {
-	static int next_txnid = 1;
+	static _Atomic int next_txnid = 1;
 	return atomic_fetch_add_explicit(&next_txnid, 1, memory_order_relaxed);
 }
 
