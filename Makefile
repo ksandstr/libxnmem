@@ -12,7 +12,7 @@ all: tags $(TEST_BIN)
 
 
 clean:
-	rm -f *.o xntest t/*.o $(TEST_BIN)
+	rm -f *.o t/*.o $(TEST_BIN)
 
 
 distclean: clean
