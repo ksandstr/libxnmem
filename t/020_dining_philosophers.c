@@ -19,7 +19,7 @@
 #include "util.h"
 
 
-#define NUM_CHAIRS 3
+#define NUM_CHAIRS 7
 #define THINK_MS 5
 #define EAT_MS 7
 
@@ -40,7 +40,7 @@ static void *philosopher_fn(void *priv UNUSED)
 	int status;
 
 	/* get us an ID, first. */
-	intptr_t id;
+	int id;
 	do {
 		status = xn_begin();
 		id = xn_read_int(&next_id);
@@ -53,37 +53,41 @@ static void *philosopher_fn(void *priv UNUSED)
 	int n_loops = id / 2 + 3;
 	int left_ix = id - 1, right_ix = id % NUM_CHAIRS;
 	diag("id=%d, n_loops=%d, left_ix=%d, right_ix=%d",
-		(int)id, n_loops, left_ix, right_ix);
+		id, n_loops, left_ix, right_ix);
 	for(int i=0; i < n_loops; i++) {
 		/* grab both forks. */
+		bool got;
 		do {
+			got = false;
 			status = xn_begin();
 			int f0 = xn_read_int(&fork_owner[left_ix]),
 				f1 = xn_read_int(&fork_owner[right_ix]);
 			if(f0 != 0 || f1 != 0) {
-				/* can't grab 'em, so abort and think a bit. */
-				xn_abort(status);
-				diag("id=%d can't pick up %d & %d (owned by f0=%d, f1=%d), thinks instead",
-					(int)id, left_ix, right_ix, f0, f1);
+				/* can't grab 'em, so flunk and think a bit. */
+				xn_retry();
+				diag("id=%d can't pick up %d & %d (owned by %d & %d), thinks instead",
+					id, left_ix, right_ix, f0, f1);
 				usleep(THINK_MS * 1000);
 				continue;
 			}
-			xn_put(&fork_owner[left_ix], (int)id);
-			xn_put(&fork_owner[right_ix], (int)id);
+			xn_put(&fork_owner[left_ix], id);
+			xn_put(&fork_owner[right_ix], id);
+			got = true;
 		} while(status = xn_commit(), XN_RESTART(status));
 		xn_abort(status);
+		assert(got);
 
 		/* got forks, so log 'em and chow down. */
 		pthread_mutex_lock(&log_mutex);
-		darray_push(eat_log, (int)id);
+		darray_push(eat_log, id);
 		pthread_mutex_unlock(&log_mutex);
 
-		diag("id=%d starts eating with %d & %d", (int)id, left_ix, right_ix);
+		diag("id=%d starts eating with %d & %d", id, left_ix, right_ix);
 		usleep(EAT_MS * 1000);
-		diag("id=%d is done eating with %d & %d", (int)id, left_ix, right_ix);
+		diag("id=%d is done eating with %d & %d", id, left_ix, right_ix);
 
 		pthread_mutex_lock(&log_mutex);
-		darray_push(eat_log, -(int)id);
+		darray_push(eat_log, -id);
 		pthread_mutex_unlock(&log_mutex);
 
 		/* down tools. */
@@ -93,7 +97,7 @@ static void *philosopher_fn(void *priv UNUSED)
 				f1 = xn_read_int(&fork_owner[right_ix]);
 			if(f0 != id || f1 != id) {
 				diag("release precondition failed; f0=%d, f1=%d; expected %d",
-					f0, f1, (int)id);
+					f0, f1, id);
 				cond_ok = false;
 				/* ... but overwrite 'em anyway. */
 			}
@@ -116,7 +120,6 @@ static int int_cmp(const void *a, const void *b) {
 int main(void)
 {
 	plan_tests(4);
-	todo_start("currently broken");
 
 	fork_owner = calloc(NUM_CHAIRS, sizeof(int));
 	pthread_t threads[NUM_CHAIRS];
@@ -135,6 +138,7 @@ int main(void)
 		int n = pthread_join(threads[i], &rv);
 		if(n != 0) {
 			diag("join of thread %d: n=%d (%s)", i, n, strerror(n));
+			continue;
 		}
 		int id = (intptr_t)rv;
 		if(id < 0) {
@@ -144,7 +148,7 @@ int main(void)
 		id = abs(id);
 		darray_push(ids, id);
 	}
-	ok1(all_cond_ok);	/* no precond failures. */
+	ok(all_cond_ok, "no precondition failures");
 
 	/* all IDs were unique. */
 	qsort(ids.item, ids.size, sizeof(*ids.item), &int_cmp);

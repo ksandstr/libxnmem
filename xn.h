@@ -12,6 +12,7 @@
 extern int xn_begin(void);
 extern int xn_commit(void);
 extern void xn_abort(int status);
+extern void xn_retry(void);
 
 /* destructors are run sometime after successful commit. they execute in an
  * indeterminate thread's context and must not call any xn_*() function. at

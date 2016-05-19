@@ -648,6 +648,20 @@ void xn_abort(int status)
 }
 
 
+void xn_retry(void)
+{
+	struct xn_client *c = get_client();
+	/* TODO: wait on a change to any of @c's existing readset. that's quite
+	 * involved, so punt into a restart instead when the caller's "continue"
+	 * caues an xn_commit().
+	 *
+	 * (FIXME: busy looping? thass' awful, ma african-american
+	 * co-conspirator.)
+	 */
+	c->snapshot_valid = false;
+}
+
+
 void xn_dtor(void (*fn)(void *param), void *param)
 {
 	struct xn_client *c = get_client();
