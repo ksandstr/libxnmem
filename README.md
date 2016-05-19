@@ -12,7 +12,7 @@ C11. Contrary to the name, it doesn't build into a shared or static library.
 The goal of this project is to have a mechanism for data management in
 concurrent programs and multiprogrammed systems that's both more powerful than
 lower-level primitives, and nicer to use than e.g. mutexes, semaphores,
-rwlocks, wait/wound mutexes, seqlocks, RCU, or 2-word atomics. Software
+rwlocks, wait/wound mutexes, seqlocks, RCU, or multiword atomics. Software
 transactional memory meets the bill by permitting composable, optimistic, and
 consistent access to shared data (making it easier to design such programs than
 e.g. by fine-grained locking), and by permitting simple handling of
@@ -24,6 +24,7 @@ Currently, `libxnmem` implements the following features:
   - snapshot isolation
   - write-to-read serialization
   - safe memory reclamation
+  - write-to-read signaling (the "retry" operation) [albeit half-assedly]
 
 It does not have:
 
@@ -35,7 +36,6 @@ It does not have:
   - two-phase commits [TODO]
   - explicit locks
   - completion guarantees in the face of pre-emption
-  - write-to-read signaling (the "retry" operation)
 
 Additionally, `libxnmem` has only been tested on an amd64 platform running both
 64-bit and 32-bit test code. Its suitability for anything besides feasibility
