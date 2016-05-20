@@ -48,6 +48,7 @@ static void *philosopher_fn(void *priv UNUSED)
 	} while(status = xn_commit(), XN_RESTART(status));
 	xn_abort(status);
 	assert(id > 0);
+	diag("ENTER id=%d", id);
 
 	bool cond_ok = true;
 	int n_loops = id / 2 + 3;
@@ -64,10 +65,9 @@ static void *philosopher_fn(void *priv UNUSED)
 				f1 = xn_read_int(&fork_owner[right_ix]);
 			if(f0 != 0 || f1 != 0) {
 				/* can't grab 'em, so flunk and think a bit. */
-				xn_retry();
-				diag("id=%d can't pick up %d & %d (owned by %d & %d), thinks instead",
+				diag("id=%d can't pick up %d & %d (owned by %d & %d)",
 					id, left_ix, right_ix, f0, f1);
-				usleep(THINK_MS * 1000);
+				xn_retry();
 				continue;
 			}
 			xn_put(&fork_owner[left_ix], id);
@@ -105,8 +105,13 @@ static void *philosopher_fn(void *priv UNUSED)
 			xn_put(&fork_owner[right_ix], 0);
 		} while(status = xn_commit(), XN_RESTART(status));
 		xn_abort(status);
+
+		/* where the cashmoney is made */
+		diag("id=%d thinks for a bit", id);
+		usleep(THINK_MS * 1000);
 	}
 
+	diag("LEAVE id=%d", id);
 	intptr_t retval = cond_ok ? id : -id;
 	return (void *)retval;
 }

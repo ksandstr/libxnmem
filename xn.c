@@ -13,6 +13,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <assert.h>
 
 #include <ccan/list/list.h>
@@ -77,6 +78,15 @@ struct xn_txn
 	 */
 	uintptr_t read_set[BF_NUM_WORDS], write_set[BF_NUM_WORDS];
 	darray(struct xn_dtor) dtors;
+};
+
+
+/* a wait record for a transaction that ended with xn_retry(). */
+struct xn_wait {
+	struct xn_wait *_Atomic next;	/* NULL for last */
+	int txnid;
+	uintptr_t read_set[BF_NUM_WORDS];
+	sem_t sem;
 };
 
 
@@ -150,6 +160,13 @@ static volatile atomic_flag epoch_lock;
  * deadlists.
  */
 static struct xn_txn *_Atomic txn_list[4];
+
+/* xn_retry()'d transactions.
+ *
+ * TODO: these should also be subject to epoch reclamation via spurious
+ * wakeups.
+ */
+static struct xn_wait *_Atomic wait_list = NULL;
 
 static struct list_head client_list = LIST_HEAD_INIT(client_list);
 static pthread_rwlock_t client_list_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -473,6 +490,21 @@ static void insert_txn(struct xn_txn *_Atomic *list_p, struct xn_txn *txn)
 }
 
 
+/* tests overlap between read_set[] format. */
+static bool bf_overlap(const uintptr_t *a, const uintptr_t *b)
+{
+	int n_hits = 0;
+	for(int i=0; i < BF_NUM_WORDS; i++) {
+		n_hits += __builtin_popcountl(a[i] & b[i]);
+	}
+	/* TODO: it'd be ideal if the bloomfilter hash function could produce
+	 * three _distinct_ indexes for any given key. then this could be a > 3
+	 * instead, improving utilization.
+	 */
+	return n_hits > 0;
+}
+
+
 int xn_commit(void)
 {
 	int rc, comm_id;
@@ -574,7 +606,9 @@ int xn_commit(void)
 
 	rc = 0;
 	if(w_list.size == 0) {
-		/* read-only: cannot participate in deadlocks. */
+		/* read-only: cannot participate in deadlocks, won't influence waiting
+		 * clients.
+		 */
 		finish_txn(txn);
 		atomic_thread_fence(memory_order_release);
 	} else {
@@ -592,6 +626,28 @@ int xn_commit(void)
 			struct xn_rec *rec = w_list.item[i];
 			atomic_store_explicit(&rec->item->version, comm_id,
 				memory_order_relaxed);
+		}
+
+		/* wake waiters up. */
+		struct xn_wait *_Atomic *head = &wait_list,
+			*w = atomic_load_explicit(head, memory_order_consume);
+		while(w != NULL) {
+			if(!bf_overlap(w->read_set, txn->write_set)) {
+				/* on to the next one. */
+				head = &w->next;
+				w = atomic_load_explicit(head, memory_order_consume);
+			} else {
+				/* try to dequeue & signal this one. */
+				struct xn_wait *next = atomic_load_explicit(&w->next,
+					memory_order_consume);
+				if(atomic_compare_exchange_strong_explicit(head, &w, next,
+					memory_order_release, memory_order_consume))
+				{
+					w->next = NULL;
+					sem_post(&w->sem);
+					w = next;
+				}
+			}
 		}
 	}
 
@@ -648,16 +704,108 @@ void xn_abort(int status)
 }
 
 
+/* find @w in wait_list and remove it. if this removes @w, it also sets
+ * @w->next to NULL.
+ */
+static void remove_wait(struct xn_wait *w)
+{
+	struct xn_wait *_Atomic *head = &wait_list,
+		*cur = atomic_load_explicit(head, memory_order_consume);
+	while(cur != NULL) {
+		struct xn_wait *next = atomic_load_explicit(&cur->next,
+			memory_order_consume);
+		if(cur != w) {
+			head = &cur->next;
+			cur = next;
+		} else {
+			if(atomic_compare_exchange_strong_explicit(head, &cur, next,
+				memory_order_release, memory_order_consume))
+			{
+				w->next = NULL;
+				return;
+			}
+		}
+	}
+}
+
+
+/* wait on a change to any of @c's existing readset, or some other wakeup
+ * event.
+ */
 void xn_retry(void)
 {
 	struct xn_client *c = get_client();
-	/* TODO: wait on a change to any of @c's existing readset. that's quite
-	 * involved, so punt into a restart instead when the caller's "continue"
-	 * caues an xn_commit().
-	 *
-	 * (FIXME: busy looping? thass' awful, ma african-american
-	 * co-conspirator.)
+
+	struct xn_wait *w = malloc(sizeof(*w));
+	if(w == NULL) {
+		perror("malloc in xn_retry");
+		abort();
+	}
+	int n = sem_init(&w->sem, 0, 0);
+	if(n != 0) {
+		perror("sem_init in xn_retry");
+		abort();
+	}
+	memcpy(w->read_set, c->txn->read_set, sizeof(c->txn->read_set));
+	w->txnid = atomic_load(&c->txnid) & ~0xff000000;
+
+	/* publish. */
+	w->next = atomic_load_explicit(&wait_list, memory_order_consume);
+	int iter = 0;
+	while(!atomic_compare_exchange_strong_explicit(&wait_list,
+		&w->next, w, memory_order_release, memory_order_consume))
+	{
+		if(iter++ >= 40) {
+			sched_yield();
+			iter--;
+		}
+	}
+
+	/* examine contemporary transactions from pre-publication. */
+	uint32_t my_epoch = atomic_load_explicit(&c->epoch, memory_order_consume),
+		g_epoch = atomic_load_explicit(&txn_epoch, memory_order_relaxed);
+	assert(my_epoch == g_epoch || my_epoch + 1 == g_epoch);
+	bool instawake = false;
+	for(int j = 0, lim = g_epoch - my_epoch + 1;
+		j < lim && !instawake;
+		j++)
+	{
+		assert(j == 0 || g_epoch == my_epoch + 1);
+		struct xn_txn *txn = atomic_load_explicit(
+			&txn_list[(g_epoch + 4 - j) & 3], memory_order_consume);
+		while(txn != NULL && txn->commit_id > w->txnid) {
+			if(bf_overlap(w->read_set, txn->write_set)) {
+				instawake = true;
+				break;
+			}
+			txn = atomic_load_explicit(&txn->next, memory_order_consume);
+		}
+	}
+
+	if(instawake) {
+		/* remove @w, but test whether it signaled while we spun as an
+		 * optimization.
+		 */
+		if(sem_trywait(&w->sem) < 0 && errno == EAGAIN) remove_wait(w);
+	} else {
+		/* sleep. */
+		do {
+			n = sem_wait(&w->sem);
+		} while(n < 0 && errno == EINTR);
+		if(n < 0 && errno != EINTR) {
+			perror("sem_wait in xn_retry");
+			abort();
+		}
+	}
+	/* poster or remove_wait() dequeues @w. */
+	assert(w->next == NULL);
+	sem_destroy(&w->sem);
+	/* FIXME: must use epoch reclamation here: otherwise @w will be examined
+	 * by any number of concurrents during free().
 	 */
+	// free(w);
+
+	/* make the following xn_commit() break immediately. */
 	c->snapshot_valid = false;
 }
 
