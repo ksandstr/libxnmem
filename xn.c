@@ -959,9 +959,10 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 }
 
 
-static void bf_insert(struct xn_client *c, void *addr, uint16_t rec_index)
+static void bf_insert(
+	int *hash,	/* passthru from bf_hash() */
+	struct xn_client *c, void *addr, uint16_t rec_index)
 {
-	int hash[3];
 	bf_hash(hash, addr);
 	for(int i=0; i < 3; i++) {
 		int limb, ix, slot;
@@ -1047,7 +1048,8 @@ int xn_read_int(int *iptr)
 	rec->version = old_ver & 0xffffff;
 	if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
 	memcpy(rec->data, &value, sizeof(int));
-	bf_insert(c, iptr, idx);
+	int hash[3];
+	bf_insert(hash, c, iptr, idx);
 	assert(find_item_rec(c, iptr) == rec);
 
 	return value;
@@ -1056,6 +1058,7 @@ int xn_read_int(int *iptr)
 
 static void *xn_modify(void *ptr, size_t length)
 {
+	int hash[3];
 	struct xn_client *c = get_client();
 	struct xn_rec *rec = find_item_rec(c, ptr);
 	if(rec != NULL) {
@@ -1063,6 +1066,7 @@ static void *xn_modify(void *ptr, size_t length)
 			fprintf(stderr, "length conflict on %p\n", ptr);
 			abort();
 		}
+		if(!rec->is_write) bf_hash(hash, ptr);
 	} else {
 		uint16_t rec_idx;
 		rec = new_xn_rec(c, &rec_idx, length);
@@ -1075,16 +1079,12 @@ static void *xn_modify(void *ptr, size_t length)
 		rec->version = atomic_load_explicit(&rec->item->version,
 			memory_order_relaxed) & 0xffffff;
 		if(rec->version > (c->txnid & 0xffffff)) c->snapshot_valid = false;
-		bf_insert(c, ptr, rec_idx);
+		bf_insert(hash, c, ptr, rec_idx);
 	}
 
 	if(!rec->is_write) {
 		rec->is_write = true;
-		/* add to write set.
-		 * TODO: this should recycle hashes computed for bf_insert().
-		 */
-		int hash[3];
-		bf_hash(hash, ptr);
+		/* add to write set. */
 		for(int i=0; i < 3; i++) {
 			int slot, limb, ix;
 			probe_pos(&slot, &limb, &ix, hash[i]);
