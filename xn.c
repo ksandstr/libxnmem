@@ -517,7 +517,10 @@ int xn_commit(void)
 	struct xn_txn *txn = NULL;
 
 	struct xn_client *client = get_client();
-	if(client->pending_retry) return -EDEADLK;
+	if(client->pending_retry) {
+		client->pending_retry = false;
+		return -EDEADLK;
+	}
 	assert(client->txn != NULL);
 	if(!client->snapshot_valid) goto serfail;
 
@@ -750,7 +753,14 @@ static void wait_dtor(void *param_ptr)
 void xn_retry(void)
 {
 	struct xn_client *c = get_client();
+	c->pending_retry = true;
 
+	/* snatch the transaction away. */
+	struct xn_txn *txn = atomic_exchange_explicit(&c->txn, NULL,
+		memory_order_consume);
+	txn->commit_id = 0;
+
+	/* create waiter, fill in readset. */
 	struct xn_wait *w = malloc(sizeof(*w));
 	if(w == NULL) {
 		perror("malloc in xn_retry");
@@ -762,7 +772,7 @@ void xn_retry(void)
 		abort();
 	}
 	for(int i=0; i < BF_NUM_WORDS; i++) {
-		w->read_set[i] = c->txn->read_set[i] | c->read_set_hi[i];
+		w->read_set[i] = txn->read_set[i] | c->read_set_hi[i];
 	}
 	w->txnid = atomic_load(&c->txnid) & ~0xff000000;
 
@@ -799,6 +809,9 @@ void xn_retry(void)
 		}
 	}
 
+	/* mark @c as not blocking epoch ticks before we sleep. */
+	clean_client(c);
+
 	if(instawake) {
 		/* remove @w, but test whether it signaled while we spun as an
 		 * optimization.
@@ -818,15 +831,10 @@ void xn_retry(void)
 	assert(w->next == NULL);
 
 	/* exploit existing epoch reclamation to safely destroy @w. */
-	struct xn_txn *txn = atomic_exchange_explicit(&c->txn, NULL,
-		memory_order_consume);
+	g_epoch = atomic_load_explicit(&txn_epoch, memory_order_consume);
 	struct xn_dtor d = { .dtor_fn = &wait_dtor, .param = w };
 	darray_push(txn->dtors, d);
-	txn->commit_id = 0;
 	insert_txn(&txn_list[g_epoch & 3], txn);
-
-	c->pending_retry = true;
-	clean_client(c);
 }
 
 

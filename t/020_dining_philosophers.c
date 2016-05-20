@@ -1,6 +1,6 @@
 
-/* the basic "dining philosophers" problem. signaling (i.e. retry) substituted
- * for with a 5ms sleep.
+/* the classic "dining philosophers" problem, solved with the STM "retry"
+ * primitive.
  */
 
 #include <stdio.h>
