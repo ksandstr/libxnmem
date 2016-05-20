@@ -107,6 +107,7 @@ struct xn_client
 
 	darray(struct xn_chunk) rec_chunks;	/* last is active */
 	bool snapshot_valid;	/* early abort criteria */
+	bool pending_retry;		/* should retry at xn_commit() */
 
 	/* bloom filters track the client's read and write sets. the read set has
 	 * two count bits per slot (split so that the low bit is in
@@ -405,6 +406,7 @@ int xn_begin(void)
 	struct xn_client *c = get_client();
 	assert(c->txn == NULL);
 	c->snapshot_valid = true;
+	c->pending_retry = false;
 	c->txn = malloc(sizeof(struct xn_txn));
 	c->txnid = gen_txnid();
 	darray_init(c->txn->dtors);
@@ -459,8 +461,8 @@ static void clean_client(struct xn_client *c)
 }
 
 
-/* insert txn into txn_list in order of descending commit ID so that the query
- * loop can early-exit.
+/* insert txn into txn_list in order of descending ->commit_id so that query
+ * loops can early-exit.
  */
 static void insert_txn(struct xn_txn *_Atomic *list_p, struct xn_txn *txn)
 {
@@ -483,6 +485,7 @@ static void insert_txn(struct xn_txn *_Atomic *list_p, struct xn_txn *txn)
 		cur != NULL;
 		cur = atomic_load(&cur->next))
 	{
+		if(cur->commit_id == 0) continue;	/* from xn_retry() */
 		assert(cur->commit_id < last);
 		last = cur->commit_id;
 	}
@@ -514,6 +517,7 @@ int xn_commit(void)
 	struct xn_txn *txn = NULL;
 
 	struct xn_client *client = get_client();
+	if(client->pending_retry) return -EDEADLK;
 	assert(client->txn != NULL);
 	if(!client->snapshot_valid) goto serfail;
 
@@ -731,6 +735,15 @@ static void remove_wait(struct xn_wait *w)
 }
 
 
+static void wait_dtor(void *param_ptr)
+{
+	struct xn_wait *w = param_ptr;
+	assert(w->next == NULL);
+	sem_destroy(&w->sem);
+	free(w);
+}
+
+
 /* wait on a change to any of @c's existing readset, or some other wakeup
  * event.
  */
@@ -803,14 +816,17 @@ void xn_retry(void)
 	}
 	/* poster or remove_wait() dequeues @w. */
 	assert(w->next == NULL);
-	sem_destroy(&w->sem);
-	/* FIXME: must use epoch reclamation here: otherwise @w will be examined
-	 * by any number of concurrents during free().
-	 */
-	// free(w);
 
-	/* make the following xn_commit() break immediately. */
-	c->snapshot_valid = false;
+	/* exploit existing epoch reclamation to safely destroy @w. */
+	struct xn_txn *txn = atomic_exchange_explicit(&c->txn, NULL,
+		memory_order_consume);
+	struct xn_dtor d = { .dtor_fn = &wait_dtor, .param = w };
+	darray_push(txn->dtors, d);
+	txn->commit_id = 0;
+	insert_txn(&txn_list[g_epoch & 3], txn);
+
+	c->pending_retry = true;
+	clean_client(c);
 }
 
 
