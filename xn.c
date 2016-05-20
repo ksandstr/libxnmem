@@ -746,7 +746,9 @@ void xn_retry(void)
 		perror("sem_init in xn_retry");
 		abort();
 	}
-	memcpy(w->read_set, c->txn->read_set, sizeof(c->txn->read_set));
+	for(int i=0; i < BF_NUM_WORDS; i++) {
+		w->read_set[i] = c->txn->read_set[i] | c->read_set_hi[i];
+	}
 	w->txnid = atomic_load(&c->txnid) & ~0xff000000;
 
 	/* publish. */
