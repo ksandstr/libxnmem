@@ -490,18 +490,20 @@ static void insert_txn(struct xn_txn *_Atomic *list_p, struct xn_txn *txn)
 }
 
 
-/* tests overlap between read_set[] format. */
+/* tests overlap between read_set[] format.
+ *
+ * this is a bit more clever than the usual bloom-filter intersection. since
+ * bf_hash() will always return distinct values, we know that an actual
+ * overlap between items will yield at least 3 bits in common. by counting
+ * these we get fewer false positives.
+ */
 static bool bf_overlap(const uintptr_t *a, const uintptr_t *b)
 {
 	int n_hits = 0;
 	for(int i=0; i < BF_NUM_WORDS; i++) {
 		n_hits += __builtin_popcountl(a[i] & b[i]);
 	}
-	/* TODO: it'd be ideal if the bloomfilter hash function could produce
-	 * three _distinct_ indexes for any given key. then this could be a > 3
-	 * instead, improving utilization.
-	 */
-	return n_hits > 0;
+	return n_hits >= 3;
 }
 
 
@@ -567,12 +569,12 @@ int xn_commit(void)
 				break;
 			}
 
-			bool w_match = false, r_match = false;
-			for(int i=0; i < BF_NUM_WORDS; i++) {
-				w_match |= (cur->write_set[i] & txn->read_set[i]) != 0;
-				r_match |= (cur->read_set[i] & txn->write_set[i]) != 0;
+			if(bf_overlap(cur->write_set, txn->read_set)
+				&& bf_overlap(cur->read_set, txn->write_set))
+			{
+				/* boom! */
+				goto serfail;
 			}
-			if(r_match && w_match) goto serfail;	/* boom! */
 		}
 	}
 
@@ -860,8 +862,30 @@ static struct xn_rec *new_xn_rec(
 }
 
 
-static inline size_t bf_hash(struct xn_client *c, void *ptr, int i) {
-	return hash_pointer(ptr, bloom_salt + i * 7);
+/* generate three distinct hash slots for @ptr within [0, BF_NUM_SLOTS). */
+static void bf_hash(int *out, void *ptr)
+{
+	int iters = 0;
+	uint32_t hash = hash_pointer(ptr, bloom_salt);
+	out[0] = hash & (BF_NUM_SLOTS - 1);
+	hash >>= BF_SIZE_LOG2;
+
+	out[1] = hash & (BF_NUM_SLOTS - 1);
+	while(out[1] == out[0]) {
+		hash = hash_pointer(ptr, bloom_salt ^ (++iters * 7));
+		out[1] = hash & (BF_NUM_SLOTS - 1);
+	}
+	hash >>= BF_SIZE_LOG2;
+
+	out[2] = hash & (BF_NUM_SLOTS - 1);
+	while(out[2] == out[0] || out[2] == out[1]) {
+		hash = hash_pointer(ptr, bloom_salt ^ (++iters * 7));
+		out[2] = hash & (BF_NUM_SLOTS - 1);
+	}
+
+	assert(out[0] != out[1]);
+	assert(out[0] != out[2]);
+	assert(out[1] != out[2]);
 }
 
 
@@ -881,14 +905,16 @@ static inline struct xn_rec *index_to_rec(struct xn_client *c, int ix)
 }
 
 
-static inline void probe_pos(int *slot, int *limb, int *ix, size_t hash)
+static inline void probe_pos(int *slot, int *limb, int *ix, int hash)
 {
+	assert((hash & ~(BF_NUM_SLOTS - 1)) == 0);
+
 	/* limb is the word index, and ix is the low bit's offset. */
 	const int shift = sizeof(uintptr_t) > 4 ? 6 : 5,
 		mask = (1 << shift) - 1;
 
-	*slot = hash & (BF_NUM_SLOTS - 1);
-	*limb = (hash >> shift) & (BF_NUM_WORDS - 1);
+	*slot = hash;
+	*limb = hash >> shift;
 	*ix = hash & mask;
 }
 
@@ -899,11 +925,13 @@ static inline void probe_pos(int *slot, int *limb, int *ix, size_t hash)
 static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 {
 	*ambig_p = false;
+	int hash[3];
+	bf_hash(hash, addr);
 	int count[3], val[3];
 	struct xn_rec *rec = NULL;
 	for(int i=0; i < 3 && rec == NULL; i++) {
 		int slot, limb, ix;
-		probe_pos(&slot, &limb, &ix, bf_hash(c, addr, i));
+		probe_pos(&slot, &limb, &ix, hash[i]);
 		count[i] = ((c->read_set_hi[limb] >> (ix - 1)) & 0x2)
 			| ((c->txn->read_set[limb] >> ix) & 0x1);
 		val[i] = c->rs_words[slot];
@@ -933,13 +961,11 @@ static struct xn_rec *bf_probe(struct xn_client *c, void *addr, bool *ambig_p)
 
 static void bf_insert(struct xn_client *c, void *addr, uint16_t rec_index)
 {
-	int prior[3] = { -1, -1, -1 };
+	int hash[3];
+	bf_hash(hash, addr);
 	for(int i=0; i < 3; i++) {
-		size_t hash = bf_hash(c, addr, i);
 		int limb, ix, slot;
-		probe_pos(&slot, &limb, &ix, hash);
-		if(prior[0] == slot || prior[1] == slot) continue;
-		prior[i] = slot;
+		probe_pos(&slot, &limb, &ix, hash[i]);
 
 		/* fancy two-bit saturating increment & lazy cleanup.
 		 *
@@ -1055,11 +1081,13 @@ static void *xn_modify(void *ptr, size_t length)
 	if(!rec->is_write) {
 		rec->is_write = true;
 		/* add to write set.
-		 * note: [v1] this could recycle hashes computed for bf_insert().
+		 * TODO: this should recycle hashes computed for bf_insert().
 		 */
+		int hash[3];
+		bf_hash(hash, ptr);
 		for(int i=0; i < 3; i++) {
 			int slot, limb, ix;
-			probe_pos(&slot, &limb, &ix, bf_hash(c, ptr, i));
+			probe_pos(&slot, &limb, &ix, hash[i]);
 			c->txn->write_set[limb] |= 1ul << ix;
 		}
 	}
