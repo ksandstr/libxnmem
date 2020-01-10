@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
@@ -25,7 +26,6 @@
 
 
 /* transaction state */
-static int next_id = 1;
 static int *fork_owner;
 
 /* a log about who started and stopped eating. start is positive philosopher
@@ -33,6 +33,7 @@ static int *fork_owner;
  */
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static darray(int) eat_log = darray_new();
+static _Atomic int next_id = 1;
 
 
 static void *philosopher_fn(void *priv UNUSED)
@@ -40,21 +41,16 @@ static void *philosopher_fn(void *priv UNUSED)
 	int status;
 
 	/* get us an ID, first. */
-	int id;
-	do {
-		status = xn_begin();
-		id = xn_read_int(&next_id);
-		xn_put(&next_id, id + 1);
-	} while(status = xn_commit(), XN_RESTART(status));
-	xn_abort(status);
+	const int id = atomic_fetch_add(&next_id, 1);
 	assert(id > 0);
-	diag("ENTER id=%d", id);
+	//diag("ENTER id=%d", id);
 
 	bool cond_ok = true;
-	int n_loops = id / 2 + 3;
-	int left_ix = id - 1, right_ix = id % NUM_CHAIRS;
+	int n_loops = id / 2 + 3, left_ix = id - 1, right_ix = id % NUM_CHAIRS;
+#if 0
 	diag("id=%d, n_loops=%d, left_ix=%d, right_ix=%d",
 		id, n_loops, left_ix, right_ix);
+#endif
 	for(int i=0; i < n_loops; i++) {
 		/* grab both forks. */
 		bool got;
@@ -64,9 +60,13 @@ static void *philosopher_fn(void *priv UNUSED)
 			int f0 = xn_read_int(&fork_owner[left_ix]),
 				f1 = xn_read_int(&fork_owner[right_ix]);
 			if(f0 != 0 || f1 != 0) {
-				/* can't grab 'em, so flunk and think a bit. */
+				/* can't grab 'em, so try again when the transaction read set
+				 * may have been written to.
+				 */
+#if 0
 				diag("id=%d can't pick up %d & %d (owned by %d & %d)",
 					id, left_ix, right_ix, f0, f1);
+#endif
 				xn_retry();
 				continue;
 			}
@@ -82,9 +82,9 @@ static void *philosopher_fn(void *priv UNUSED)
 		darray_push(eat_log, id);
 		pthread_mutex_unlock(&log_mutex);
 
-		diag("id=%d starts eating with %d & %d", id, left_ix, right_ix);
+		//diag("id=%d starts eating with %d & %d", id, left_ix, right_ix);
 		usleep(EAT_MS * 1000);
-		diag("id=%d is done eating with %d & %d", id, left_ix, right_ix);
+		//diag("id=%d is done eating with %d & %d", id, left_ix, right_ix);
 
 		pthread_mutex_lock(&log_mutex);
 		darray_push(eat_log, -id);
@@ -107,11 +107,11 @@ static void *philosopher_fn(void *priv UNUSED)
 		xn_abort(status);
 
 		/* where the cashmoney is made */
-		diag("id=%d thinks for a bit", id);
+		//diag("id=%d thinks for a bit", id);
 		usleep(THINK_MS * 1000);
 	}
 
-	diag("LEAVE id=%d", id);
+	//diag("LEAVE id=%d", id);
 	intptr_t retval = cond_ok ? id : -id;
 	return (void *)retval;
 }
@@ -126,7 +126,9 @@ int main(void)
 {
 	plan_tests(4);
 
+	darray_make_room(eat_log, 1000); /* would realloc under mutex otherwise */
 	fork_owner = calloc(NUM_CHAIRS, sizeof(int));
+
 	pthread_t threads[NUM_CHAIRS];
 	for(int i=0; i < NUM_CHAIRS; i++) {
 		int n = pthread_create(&threads[i], NULL, &philosopher_fn, NULL);
